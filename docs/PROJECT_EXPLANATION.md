@@ -1,62 +1,40 @@
-# Swarm — Complete Project Explanation & Architecture
+# Swarm — Project Architecture & Capabilities Summary
 
-## 1. What Is Swarm?
+## 1. Overview
 
-**Swarm** is a multi-agent **Automated Code Review Platform** that audits software changes before developers merge them.
-
-Instead of relying on a single LLM prompt over a partial diff, Swarm splits every review across **six specialized AI agents** orchestrated with **Microsoft Agent Framework** (`WorkflowBuilder`) using a **Fan-Out / Fan-In** architecture, anchored in **deterministic static analysis, security scanners, syntax parsers, and test runners**:
-
-> Developer submits code (GitHub PR, GitHub Commit, Branch Comparison, Full Codebase Audit, or Local Git Diff)  
-> → **4 Analysis Agents run concurrently (Fan-Out)**  
-> → **Reviewer Manager (Fan-In)** verifies file/line existence on disk, strips false positives, blocks unbacked claims, and decides `Approve` / `Request Changes` / `Incomplete`  
-> → **Fix-Suggestion Agent** proposes minimal `git apply --check` + AST/Node syntax-validated patches (with automatic 1-shot self-repair)  
-> → Developer reviews findings side-by-side in Monaco Editor and explicitly approves, applies locally, or commits fixes back to GitHub.
+**Swarm** is a multi-agent **Automated Code Review Platform** built with **Next.js 15**, **FastAPI**, and **Microsoft Agent Framework** (`WorkflowBuilder`). Instead of passing a truncated diff into a single LLM prompt, Swarm executes pre-Fan-Out indexing and risk planning, runs deterministic static, taint, style, security, and test engines, fans out across **4 parallel specialist agents**, enforces LLM-independent verification inside **`EvidenceGuard` + Reviewer Manager (Fan-In)**, and validates patches inside an isolated temporary workspace copy before awaiting human approval.
 
 ---
 
-## 2. Real-World Problems & Swarm Engineering Safeguards
+## 2. Real-World Safeguards Implemented
 
-| Review Pitfall | How Swarm Solves It |
+| Review Pitfall | How Swarm Resolves It |
 |---|---|
-| Manual PR reviews bottleneck engineering teams | Parallel 4-agent Fan-Out analysis across diff, style, security & tests |
-| LLMs hallucinate "missing validation" when viewing truncated diffs | Complete line-numbered files + `[COMPLETE FILE]` headers + `extract_polyglot_file_facts` guard index |
-| False "no tests found" alerts on helper modules | Cross-file test-import mapping (`test_tools.py`) traces direct & indirect imports + Vitest/Pytest discovery |
-| Mock fixture tokens in tests flagged as Critical leaks | Gitleaks + `is_test_fixture_hit` downgrades obvious synthetic test fixtures cleanly |
-| Unverified LLM guesses block builds | Reviewer Manager blocks LLM-invented `Verified` tags unless backed by a real tool hit and disk evidence |
-| Broken patches suggested by AI | `difflib` + `git apply --check` + Python `ast.parse` / Node VM syntax check + 1-shot self-repair |
-| Stopping slow runs still drains tokens | Instant `Stop Operation` closes `AsyncOpenAI` clients, cancels tasks, kills subprocesses, and adds Re-run / Leave Task controls |
+| Missing context from truncated diffs | STAIR 4-level `StructureIndex` + `STAIRContextBuilder` delivers changed symbols, callers, callees, imports, `implemented_guards`, and linked tests within strict per-agent token budgets. |
+| Self-certified `Verified` tags & invented tool names | `EvidenceGuard` builds an immutable `EV-NNN` `EvidenceStore` and promotes `"Verified"` only on exact `(file_path, tool/rule, line ±3)` matches. |
+| Agents claiming tests ran from code reading | `AgentCapabilities` (`permissions.py`) + `enforce_agent_permissions` strip test-execution assertions when no verified `pytest`/`vitest` execution telemetry exists. |
+| False "no tests found" on helper modules | Cross-file test-import mapping (`test_tools.py`) traces direct, indirect, and mocked-only imports across Python and TS/JS suites. |
+| Docs-only PRs failing or wasting tokens | `ReviewPlanner` classifies docs-only changes `low` risk (`skipped_by_plan`), while Style & Security agents apply deterministic token-saver LLM skips and incremental `ReviewCache`. |
+| Broken AI-suggested patches | `FixSuggestionAgentExecutor` strictly gates patches via `is_patch_eligible`, detects source SHA conflicts, and validates in an isolated temp copy via `git apply --check`, AST/Node syntax checks, security + taint rescan, optional `mypy`/`tsc`, and targeted `pytest`. |
+| Slow runs burning tokens after stop | `Stop Operation` closes tracked `AsyncOpenAI` clients, cancels the workflow task, and kills child subprocesses. |
 
 ---
 
-## 3. Five-Layer Architecture
+## 3. The Six Sub-Agents
 
-1. **Frontend (`frontend/`)**: Next.js 15, React 19, TypeScript, Tailwind CSS v4, Monaco Editor, WebSockets, and interactive WebGL components (`LiquidNavbar`, `LiveOrb`, `GlassFolder`).
-2. **Backend (`backend/app/`)**: FastAPI REST routers, real-time WebSockets (`/ws/reviews/{id}`, `/ws/activity`), isolated Git sandbox manager, active cancellation registry, and Fernet secret encryption.
-3. **Multi-Agent Orchestration (`backend/app/orchestration/`, `backend/app/agents/`)**:
-   - Microsoft Agent Framework `WorkflowBuilder` (`add_fan_out_edges`, `add_fan_in_edges`, `add_edge`, `WorkflowContext`).
-   - DeepSeek OpenAI-compatible client (`OpenAIChatCompletionClient`) with bounded HTTP & `asyncio.wait_for` timeouts (`70s–95s`).
-4. **Deterministic Analysis & Accuracy Engines (`backend/app/scanners/`)**:
-   - **Semgrep**, **Gitleaks**, **Bandit**, **OSV-Scanner**, **Ruff**, **Pytest**, **Coverage.py**, **Node syntax VM parser**, and **Git**.
-5. **Persistence Layer (`backend/app/models/tables.py`)**:
-   - SQLAlchemy async models supporting zero-Docker local **SQLite** or **PostgreSQL + Redis + Celery** (`docker-compose.yml`).
-
----
-
-## 4. The Six Sub-Agents
-
-| Agent | Execution Stage | Default DeepSeek Model | Deterministic Tools | Responsibility |
+| Agent | Execution Stage | Default Model | Core Engines & Token Budget | Responsibility & Permissions |
 |---|---|---|---|---|
-| **Diff Agent** | Fan-Out (Parallel) | `deepseek-flash` | `git diff`, Polyglot Symbol & Guard Extractor | Summarizes code changes, affected files, and line-grounded behavioral risks. |
-| **Style Agent** | Fan-Out (Parallel) | `deepseek-flash` | `ruff`, Python AST complexity, Node JS/TS syntax parser, 6-line duplicate detector | Detects syntax breaks, complexity spikes, dynamic imports, duplication, and style defects. |
-| **Security Agent** | Fan-Out (Parallel) | `deepseek-v4-pro` | `semgrep`, `bandit`, `gitleaks`, `osv-scanner`, SSRF/Auth guards | Identifies exploitable vulnerabilities, credential leaks, and vulnerable dependencies. |
-| **Test-Coverage Agent** | Fan-Out (Parallel) | `deepseek-flash` | `pytest`, `coverage.py`, Vitest/Pytest test-import mapper | Executes tests cleanly and traces direct/indirect test coverage gaps. |
-| **Reviewer Manager** | Fan-In Barrier | `deepseek-v4-pro` | Disk line verifier, Deterministic index, Policy Engine | Deduplicates findings, isolates `rejected_false_positives`, enforces evidence checks, and outputs decision. |
-| **Fix-Suggestion Agent** | Patch Synthesis | `deepseek-v4-pro` | `difflib`, `git apply --check`, AST/Node syntax checker, Test contract extractor | Proposes minimal fixes verified cleanly against syntax & git apply; always human-gated. |
+| **Diff Agent** | Fan-Out (Parallel) | `deepseek-flash` | `git diff`, `diff-ast-engine` (base vs. target AST, API contracts, config impact), STAIR slices (`3,000` / `1,200` tokens) | Summarizes semantic diffs & blast radius; read-only, cannot propose patches or claim test runs. |
+| **Style Agent** | Fan-Out (Parallel) | `deepseek-flash` | Cached `ruff`, optional `eslint`/`pylint`, AST complexity/nesting/coupling/dead-code/naming, Node TS syntax check (`2,000` tokens) | Reports exact lint/dead-code violations; skips LLM completely when lints are clean/unambiguous. |
+| **Security Agent** | Fan-Out (Parallel) | `deepseek-v4-pro` | Cached `semgrep`, `bandit`, `gitleaks`, `osv-scanner`, `security-guard`, `security-taint` (SQLi/CMDi/path/authz/crypto), optional `codeql`/`trivy` (`5,000` / `6,500` tokens) | Traces exploitability across trust boundaries; skips deep LLM scan on clean low-risk/docs diffs. |
+| **Test-Coverage Agent** | Fan-Out (Parallel) | `deepseek-flash` | Impact-graph selective `pytest`/`vitest`, `coverage.py`, `test-mapper`, failure triage (`code` vs `env`/`dep`), `Hypothesis`/`Mutmut` detector (`3,500` tokens) | Executes impacted tests cleanly without falsifying coverage or mutation execution. |
+| **Reviewer Manager** | Fan-In Barrier | `deepseek-v4-pro` | `EvidenceStore` (`EV-NNN`), `enforce_agent_permissions`, contradiction detector, severity normalizer, policy engine (`3,000` / `3,900` tokens) | Blocks fabricated tags, calibrates confidence separately from `Verified`, computes policy recommendation. |
+| **Fix-Suggestion Agent** | Patch Sandbox | `deepseek-v4-pro` | `is_patch_eligible` gate, SHA conflict guard, isolated temp sandbox (`git apply --check`, syntax, security+taint rescan, optional `mypy`/`tsc`, targeted tests) (`4,000` tokens) | Only agent allowed to propose diffs (never auto-commits); strictly gated to `Verified` `EV-NNN` defects. |
 
 ---
 
-## 5. GitHub Sync, Local Companion & Security Controls
+## 4. GitHub Integration, Local Companion & Hardening
 
-- **GitHub Sync & Built-In Explorer**: Supports 1-click GitHub CLI (`gh`) auth, PATs, GitHub OAuth, full-tree repository exploration with local Git mirror fallback when REST rate-limited, webhook auto-reviews (`X-Hub-Signature-256` verified), and PR inline comment publishing.
-- **Local Companion (`local-companion/`)**: Binds strictly to `127.0.0.1:8765`, validates rotating 30-minute pairing tokens (`hmac.compare_digest`), validates local backend targets against SSRF, enforces root confinement, and excludes `.env` and key files before extracting diffs.
-- **Git & Path Hardening**: Strict Git ref validation rejects CLI flag injection (`--...`), path containment blocks `..` escapes/symlinks, and scanner subprocesses run under a sanitized environment stripping application secrets.
+- **GitHub Sync & Explorer**: Supports 1-click `gh` CLI connect, PAT, OAuth Web Flow, OAuth Device Flow, rate-limit mirror fallback (`_mirrors/`), HMAC webhooks + 90s background PR poller, Markdown/inline PR publishing, and single or batch **Approve & Commit All to GitHub**.
+- **Local Companion (`local-companion/`)**: Binds to `127.0.0.1:8765`, requires 30-minute rotating `X-Pairing-Token` (`hmac.compare_digest`), validates loopback/HTTPS backend targets, and strips `.env`/keys before extracting diffs.
+- **Git, Secret & Process Isolation**: `validate_git_ref` blocks flag injection, `resolve_within_dir` confines reads inside sandboxes, Fernet encrypts keys/tokens at rest (`260,000`-iteration PBKDF2 passwords), `0o500` `GIT_ASKPASS` avoids URL tokens, and `sanitized_subprocess_env()` strips secrets from scanner subprocesses.
