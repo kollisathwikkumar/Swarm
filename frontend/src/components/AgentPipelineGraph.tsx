@@ -108,6 +108,8 @@ function AgentOrbNode({
             <AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" />
             Incomplete
           </span>
+        ) : run.status === "idle" ? (
+          <span className="text-muted-foreground">Ready</span>
         ) : (
           <span className="text-muted-foreground">Queued</span>
         )}
@@ -128,17 +130,22 @@ function AgentOrbNode({
   );
 }
 
-export function AgentPipelineGraph({ agentRuns, liveMessages = {} }: AgentPipelineGraphProps) {
+export function AgentPipelineGraph({
+  agentRuns,
+  liveMessages = {},
+  reviewStatus = "queued",
+}: AgentPipelineGraphProps) {
   const byKey = new Map<string, AgentRunItem>();
   for (const r of agentRuns) byKey.set(r.agent_name, r);
 
+  const fallbackStatus = reviewStatus === "idle" ? "idle" : "queued";
   const getOrFallback = (key: string, label: string, model: string): AgentRunItem =>
     byKey.get(key) || {
       id: key,
       agent_name: key,
       agent_label: label,
       model_used: model,
-      status: "queued",
+      status: fallbackStatus,
       summary: "",
       duration_ms: 0,
     };

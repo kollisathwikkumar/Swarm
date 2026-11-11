@@ -41,7 +41,13 @@ export default function AgentActivityPage() {
           (r) => r.review_status === "running" || r.review_status === "queued"
         ) || null;
       setActiveRunningReview(running);
-      const targetId = running?.id || revsRes.reviews[0]?.id;
+      if (running && typeof window !== "undefined") {
+        window.sessionStorage.removeItem("swarm_agents_detached");
+      }
+      const isDetached =
+        typeof window !== "undefined" &&
+        window.sessionStorage.getItem("swarm_agents_detached") === "1";
+      const targetId = running?.id || (isDetached ? undefined : revsRes.reviews[0]?.id);
       if (targetId) {
         const detail = await apiFetch<ReviewDetailResponse>(`/api/reviews/${targetId}`);
         setLatestReview(detail);
@@ -61,6 +67,9 @@ export default function AgentActivityPage() {
       onMessage: (evt) => {
         try {
           const data = JSON.parse(evt.data) as LiveEvent;
+          if (data.event_type === "review_started" && typeof window !== "undefined") {
+            window.sessionStorage.removeItem("swarm_agents_detached");
+          }
           setLiveEvents((prev) => [data, ...prev].slice(0, 40));
           if (data.agent_name && (data.message || data.summary || data.error)) {
             setLiveMessages((prev) => ({
@@ -125,6 +134,9 @@ export default function AgentActivityPage() {
     setError("");
     setStatusNotice("");
     try {
+      if (typeof window !== "undefined") {
+        window.sessionStorage.removeItem("swarm_agents_detached");
+      }
       await apiFetch(`/api/reviews/${targetId}/rerun`, { method: "POST" });
       setLiveMessages({});
       setStatusNotice("Re-running review with all 6 agents.");
@@ -143,9 +155,15 @@ export default function AgentActivityPage() {
     setError("");
     setStatusNotice("");
     try {
+      if (typeof window !== "undefined") {
+        window.sessionStorage.setItem("swarm_agents_detached", "1");
+      }
       await apiFetch(`/api/reviews/${targetId}`, { method: "DELETE" });
+      setLatestReview(null);
+      setActiveRunningReview(null);
       setLiveMessages({});
-      setStatusNotice("Left stopped task.");
+      setLiveEvents([]);
+      setStatusNotice("Left stopped task — all 6 agents returned to idle.");
       await loadData();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed leaving stopped task");

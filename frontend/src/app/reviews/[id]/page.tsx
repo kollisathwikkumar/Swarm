@@ -249,6 +249,9 @@ export default function ConsolidatedCodeReviewPage() {
     setError("");
     setStatusNotice("");
     try {
+      if (typeof window !== "undefined") {
+        window.sessionStorage.setItem("swarm_agents_detached", "1");
+      }
       await apiFetch(`/api/reviews/${reviewId}`, { method: "DELETE" });
       router.push("/agents");
     } catch (err) {
