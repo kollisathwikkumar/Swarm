@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import hashlib
 import json
 import logging
+import os
+import shutil
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
@@ -26,6 +29,13 @@ from app.scanners.code_engines import (
     run_deterministic_code_guards,
     verify_code_syntax,
 )
+from app.scanners.security_taint import run_taint_and_threat_analysis
+from app.scanners.tool_runner import (
+    resolve_binary,
+    resolve_workspace_binary,
+    run_command_capture,
+    sanitized_subprocess_env,
+)
 from app.services.git_workspace import resolve_within_dir, verify_patch_applicability
 from app.skills.shared_contracts import format_agent_contract
 from app.verification.evidence_guard import is_patch_eligible
@@ -33,16 +43,18 @@ from app.verification.evidence_guard import is_patch_eligible
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are the Fix-Suggestion Agent in Swarm.
-You receive a high-priority actionable code review finding, the exact target source code, and any Existing Test Contracts covering that file.
+You receive an EvidenceGuard-Verified defect, its root-cause & target source code, STAIR caller/import context, and Existing Test Contracts.
 Rules:
-1. Fix ONLY the identified defect cleanly with minimal collateral changes, preserving indentation, exports, and existing public behavior.
-2. MUST preserve every existing test expectation in `Existing Test Contracts` (e.g. exact thrown error regex substrings like /HTTPS/, test endpoints, return shapes). If adding SSRF/private-IP blocking to a configurable endpoint validator, block loopback/private/link-local IPs cleanly WITHOUT hardcoding a closed hostname allowlist that rejects arbitrary test or user-configured HTTPS endpoints unless explicitly requested.
-3. Verify every regex literal, escape sequence, quote, and bracket carefully so the file compiles cleanly with zero syntax errors.
+1. Perform root-cause analysis and fix ONLY the identified defect with minimal AST-safe edits, reusing existing repository helpers/patterns and preserving indentation, exports, and existing public behavior.
+2. MUST preserve every existing test expectation in `Existing Test Contracts` (e.g. exact thrown error regex substrings like /HTTPS/, test endpoints, return shapes).
+3. Verify every regex literal, escape sequence, quote, type annotation, and bracket carefully so syntax & type checks pass cleanly.
+4. Optionally provide a minimal regression test function/snippet (`regression_test_code`) that reproduces and verifies the fix when safe.
 Return strict JSON:
 {
   "title": "Short patch title describing the fix",
   "corrected_code": "THE EXACT complete corrected code matching the provided snippet/file scope (with NO placeholders or '...').",
-  "explanation": "Clear explanation of why this change resolves the issue without breaking existing tests."
+  "explanation": "Root-cause explanation + why this minimal patch resolves the issue without breaking existing tests.",
+  "regression_test_code": "Optional minimal unit test verifying this fix (empty string if unnecessary)."
 }"""
 
 
@@ -155,40 +167,157 @@ def _extract_test_contract_context(state: ReviewState, rel_path: str) -> str:
     return "\n\n".join(excerpts)
 
 
+def _related_tests_for_file(state: ReviewState, rel_path: str) -> list[str]:
+    test_res = (state.agent_results.get("test_coverage_agent") or {}).get("tool_results") or {}
+    tmap = (test_res.get("test_import_map") or {}).get("source_file_test_map") or {}
+    info = tmap.get(rel_path) or {}
+    direct_ind = list(info.get("direct_tests") or []) + list(info.get("indirect_importing_tests") or [])
+    stair_links = ((state.structure_index.get("graphs") or {}).get("test_links") or {}).get(rel_path) or []
+    return list(dict.fromkeys(direct_ind + list(stair_links)))
+
+
+def _check_patch_conflict(
+    workspace_dir: Path,
+    finding: dict[str, Any],
+    evidence_store: list[dict[str, Any]],
+) -> tuple[bool, str]:
+    """Detect stale source files modified since deterministic EvidenceStore capture."""
+    rel_path = str(finding.get("file_path") or "").strip()
+    target = resolve_within_dir(workspace_dir, rel_path)
+    if target is None or not target.exists() or not target.is_file():
+        return False, f"Target file `{rel_path}` missing from workspace."
+    cur_hash = hashlib.sha256(target.read_bytes()).hexdigest()[:16]
+    ev_ids = set(finding.get("evidence_ids") or [])
+    for rec in evidence_store:
+        if rec.get("evidence_id") in ev_ids and rec.get("source_hash") and rec["source_hash"] != cur_hash:
+            return False, (
+                f"Patch conflict detected: `{rel_path}` hash changed ({cur_hash}) since "
+                f"{rec['evidence_id']} capture ({rec['source_hash']})."
+            )
+    return True, "No source conflict"
+
+
+def _copy_workspace_for_validation(src_ws: Path, dst_ws: Path) -> None:
+    skip_names = {".git", ".venv", "venv", "__pycache__", ".pytest_cache", "_cache", ".next", "dist"}
+    for root_str, dirs, files in os.walk(src_ws):
+        rel_root = Path(root_str).relative_to(src_ws)
+        if "node_modules" in dirs:
+            dirs.remove("node_modules")
+            nm_dst = dst_ws / rel_root / "node_modules"
+            nm_dst.parent.mkdir(parents=True, exist_ok=True)
+            if not nm_dst.exists():
+                nm_dst.symlink_to(Path(root_str) / "node_modules", target_is_directory=True)
+        dirs[:] = [d for d in dirs if d not in skip_names]
+        (dst_ws / rel_root).mkdir(parents=True, exist_ok=True)
+        for fname in files:
+            src_f = Path(root_str) / fname
+            if src_f.is_file() and src_f.stat().st_size <= 2_000_000:
+                shutil.copy2(src_f, dst_ws / rel_root / fname)
+
+
 async def _validate_patch_bundle(
-    workspace_dir: Path, rel_path: str, proposed_code: str, unified_diff: str
+    workspace_dir: Path,
+    rel_path: str,
+    proposed_code: str,
+    unified_diff: str,
+    *,
+    related_tests: list[str] | None = None,
+    regression_test_code: str = "",
 ) -> tuple[bool, bool, bool, str]:
     apply_ok, apply_msg = await verify_patch_applicability(workspace_dir, rel_path, unified_diff)
     syntax_ok, syntax_msg = await verify_code_syntax(rel_path, proposed_code, workspace_dir)
 
-    # Guard revalidation: ensure patch does not introduce any new Critical/High deterministic security guard alerts
+    # Security + Taint Revalidation: ensure patch does not introduce any new Critical/High security or taint alerts
     guard_ok = True
-    guard_msg = "Security guard recheck passed"
+    guard_msg = "Security & taint rescan passed"
     before_guards = await run_deterministic_code_guards(workspace_dir, [rel_path])
+    before_taint = run_taint_and_threat_analysis(workspace_dir, [rel_path])
     before_rules = {
         (f.get("rule_id"), f.get("severity"))
-        for f in (before_guards.get("findings") or [])
+        for f in (before_guards.get("findings") or []) + (before_taint.get("findings") or [])
         if f.get("severity") in ("Critical", "High")
     }
-    with tempfile.TemporaryDirectory(prefix="swarm_patch_guard_") as tmp_dir:
+
+    type_ok = True
+    type_msg = "Type check: optional skipped"
+    test_ok = True
+    test_msg = "Tests: none impacted"
+
+    with tempfile.TemporaryDirectory(prefix="swarm_patch_val_") as tmp_dir:
         tmp_ws = Path(tmp_dir)
+        _copy_workspace_for_validation(workspace_dir, tmp_ws)
         tmp_file = resolve_within_dir(tmp_ws, rel_path)
         if tmp_file is not None:
             tmp_file.parent.mkdir(parents=True, exist_ok=True)
             tmp_file.write_text(proposed_code, encoding="utf-8")
+
             after_guards = await run_deterministic_code_guards(tmp_ws, [rel_path])
+            after_taint = run_taint_and_threat_analysis(tmp_ws, [rel_path])
             new_high_risk = [
                 f
-                for f in (after_guards.get("findings") or [])
+                for f in (after_guards.get("findings") or []) + (after_taint.get("findings") or [])
                 if f.get("severity") in ("Critical", "High")
                 and (f.get("rule_id"), f.get("severity")) not in before_rules
             ]
             if new_high_risk:
                 guard_ok = False
-                guard_msg = f"Introduced {len(new_high_risk)} new security guard issue(s): {new_high_risk[0].get('rule_id')}"
+                guard_msg = f"Introduced {len(new_high_risk)} new security/taint issue(s): {new_high_risk[0].get('rule_id')}"
 
-    combined_ok = apply_ok and syntax_ok and guard_ok
-    validation_output = f"git apply --check: {apply_msg} | Syntax check: {syntax_msg} | {guard_msg}"
+            # Optional type checker (mypy for Python or tsc --noEmit for TS repos with tsconfig.json)
+            if rel_path.endswith(".py"):
+                mypy_bin = resolve_workspace_binary(workspace_dir, "mypy")
+                if mypy_bin:
+                    tc = await run_command_capture([mypy_bin, "--ignore-missing-imports", rel_path], cwd=tmp_ws, timeout=30)
+                    if tc["returncode"] != 0:
+                        type_ok = False
+                        type_msg = f"Type check failed (mypy): {(tc['stdout'] or tc['stderr'])[:160]}"
+                    else:
+                        type_msg = "Type check passed (mypy)"
+            elif rel_path.endswith((".ts", ".tsx")) and (tmp_ws / "tsconfig.json").exists():
+                tsc_bin = resolve_workspace_binary(workspace_dir, "tsc")
+                if tsc_bin:
+                    tc = await run_command_capture([tsc_bin, "--noEmit"], cwd=tmp_ws, timeout=45)
+                    if tc["returncode"] != 0:
+                        type_ok = False
+                        type_msg = f"Type check failed (tsc): {(tc['stdout'] or tc['stderr'])[:160]}"
+                    else:
+                        type_msg = "Type check passed (tsc)"
+
+            # Targeted test execution on the isolated patched copy (never modifies workspace_dir!)
+            py_related = [t for t in (related_tests or []) if t.endswith(".py") and (tmp_ws / t).exists()]
+            repro_rel: str | None = None
+            if regression_test_code.strip() and rel_path.endswith(".py"):
+                ok_reg, _ = await verify_code_syntax("test_swarm_repro.py", regression_test_code, tmp_ws)
+                if ok_reg:
+                    repro_path = tmp_ws / "test_swarm_repro.py"
+                    repro_path.write_text(regression_test_code, encoding="utf-8")
+                    repro_rel = "test_swarm_repro.py"
+
+            pytest_targets = list(py_related)
+            if repro_rel:
+                pytest_targets.append(repro_rel)
+            if pytest_targets:
+                pytest_bin = resolve_binary("pytest")
+                if pytest_bin:
+                    env = sanitized_subprocess_env()
+                    env["PYTHONPATH"] = str(tmp_ws)
+                    pt = await run_command_capture(
+                        [pytest_bin, "-q", "--tb=short", *pytest_targets],
+                        cwd=tmp_ws,
+                        timeout=45,
+                        env=env,
+                    )
+                    if pt["returncode"] != 0:
+                        test_ok = False
+                        test_msg = f"Targeted tests failed: {(pt['stdout'] or pt['stderr'])[-180:]}"
+                    else:
+                        test_msg = f"Targeted tests passed ({len(pytest_targets)} file(s))"
+
+    combined_ok = apply_ok and syntax_ok and guard_ok and type_ok and test_ok
+    validation_output = (
+        f"git apply --check: {apply_msg} | Syntax check: {syntax_msg} | "
+        f"{guard_msg} | {type_msg} | {test_msg}"
+    )
     return combined_ok, apply_ok, syntax_ok, validation_output
 
 
@@ -260,9 +389,16 @@ class FixSuggestionAgentExecutor(Executor):
                 if is_review_cancelled(state.review_id):
                     raise ReviewCancelledError("Review stopped by user.")
                 rel_path = finding["file_path"]
+                conflict_ok, conflict_msg = _check_patch_conflict(
+                    state.workspace_dir, finding, state.evidence_store
+                )
+                if not conflict_ok:
+                    logger.info("Skipping stale patch target: %s", conflict_msg)
+                    continue
                 target_file = resolve_within_dir(state.workspace_dir, rel_path)
                 if target_file is None or not target_file.exists():
                     continue
+                related_tests = _related_tests_for_file(state, rel_path)
                 original_code = target_file.read_text(
                     encoding="utf-8", errors="replace"
                 )
@@ -319,6 +455,7 @@ class FixSuggestionAgentExecutor(Executor):
                     or ""
                 )
                 explanation = str(llm_out.get("explanation") or "")
+                regression_test_code = str(llm_out.get("regression_test_code") or "").strip()
                 title = str(llm_out.get("title") or f"Fix: {finding.get('title')}")
 
                 if not corrected_snippet.strip():
@@ -332,17 +469,22 @@ class FixSuggestionAgentExecutor(Executor):
 
                 unified_diff = _compute_unified_diff(rel_path, original_code, proposed_code)
                 applicable, _, _, validation_output = await _validate_patch_bundle(
-                    state.workspace_dir, rel_path, proposed_code, unified_diff
+                    state.workspace_dir,
+                    rel_path,
+                    proposed_code,
+                    unified_diff,
+                    related_tests=related_tests,
+                    regression_test_code=regression_test_code,
                 )
 
-                # Automatic 1-shot Self-Repair if git apply or language syntax parser failed
+                # Automatic 1-shot Self-Repair if git apply, syntax, type, security, or targeted tests failed
                 if not applicable:
                     repair_prompt = (
                         f"Your previous fix for `{rel_path}` FAILED deterministic verification:\n"
                         f"ERROR: {validation_output}\n\n"
                         f"Previous corrected_code:\n```\n{corrected_snippet}\n```\n\n"
                         f"Original {scope_label}:\n```\n{target_snippet}\n```\n"
-                        "Return the repaired `corrected_code` with ZERO syntax errors, preserving regexes and surrounding code."
+                        "Return the repaired `corrected_code` passing syntax, security, type, and test checks cleanly."
                     )
                     repaired = await run_structured_agent(
                         cfg, system_prompt=SYSTEM_PROMPT, user_prompt=repair_prompt, timeout_seconds=70.0
@@ -357,7 +499,12 @@ class FixSuggestionAgentExecutor(Executor):
                         if cand_code != original_code:
                             cand_diff = _compute_unified_diff(rel_path, original_code, cand_code)
                             cand_ok, _, _, cand_val = await _validate_patch_bundle(
-                                state.workspace_dir, rel_path, cand_code, cand_diff
+                                state.workspace_dir,
+                                rel_path,
+                                cand_code,
+                                cand_diff,
+                                related_tests=related_tests,
+                                regression_test_code=str(repaired.get("regression_test_code") or regression_test_code),
                             )
                             proposed_code = cand_code
                             unified_diff = cand_diff
@@ -365,6 +512,8 @@ class FixSuggestionAgentExecutor(Executor):
                             validation_output = cand_val
                             if repaired.get("explanation"):
                                 explanation = str(repaired["explanation"])
+                if regression_test_code:
+                    explanation = f"{explanation}\n\nSuggested regression test:\n```\n{regression_test_code[:1200]}\n```"
 
                 proposals.append(
                     PatchProposal(

@@ -16,6 +16,7 @@ from app.scanners.code_engines import (
     prioritize_repo_files,
     run_deterministic_code_guards,
 )
+from app.scanners.security_taint import run_taint_and_threat_analysis
 from app.scanners.tool_runner import get_tool_version, resolve_binary, run_command_capture
 
 LOCAL_SEMGREP_RULES = Path(__file__).resolve().parent / "semgrep_rules.yml"
@@ -305,6 +306,112 @@ async def run_osv_scanner(workspace_dir: Path) -> dict[str, Any]:
     return {"status": "incomplete", "findings": findings, "error": res["stderr"][:500]}
 
 
+async def run_trivy(workspace_dir: Path) -> dict[str, Any]:
+    """Optional Trivy filesystem vulnerability & misconfiguration scanner."""
+    trivy_bin = resolve_binary("trivy")
+    if not trivy_bin:
+        return {"status": "optional_unavailable", "findings": [], "error": ""}
+    res = await run_command_capture(
+        [trivy_bin, "fs", "--format", "json", "--quiet", "--scanners", "vuln,misconfig", str(workspace_dir)],
+        cwd=workspace_dir,
+        timeout=90,
+    )
+    if res["timed_out"]:
+        return {"status": "incomplete", "findings": [], "error": "trivy scan timed out"}
+    findings: list[dict[str, Any]] = []
+    if res["stdout"].strip():
+        try:
+            data = json.loads(res["stdout"])
+            for result in data.get("Results", []) or []:
+                target_file = _rel_path(workspace_dir, str(result.get("Target") or "requirements.txt"))
+                for vuln in result.get("Vulnerabilities", []) or []:
+                    findings.append(
+                        {
+                            "tool": "trivy",
+                            "rule_id": vuln.get("VulnerabilityID", "TRIVY-VULN"),
+                            "title": f"Trivy CVE: {vuln.get('PkgName')} ({vuln.get('VulnerabilityID')})",
+                            "file_path": target_file,
+                            "line_number": 1,
+                            "severity": _normalize_severity(vuln.get("Severity")),
+                            "evidence": str(vuln.get("Title") or vuln.get("Description") or "")[:240],
+                            "description": str(vuln.get("Description") or "")[:300],
+                        }
+                    )
+                for mis in result.get("Misconfigurations", []) or []:
+                    findings.append(
+                        {
+                            "tool": "trivy",
+                            "rule_id": mis.get("ID", "TRIVY-MISCONFIG"),
+                            "title": str(mis.get("Title") or "Trivy Misconfiguration"),
+                            "file_path": target_file,
+                            "line_number": (mis.get("CauseMetadata") or {}).get("StartLine") or 1,
+                            "severity": _normalize_severity(mis.get("Severity")),
+                            "evidence": str(mis.get("Message") or "")[:240],
+                            "description": str(mis.get("Description") or "")[:300],
+                        }
+                    )
+            return {"status": "completed", "findings": findings[:40], "error": ""}
+        except json.JSONDecodeError:
+            pass
+    if res["returncode"] in (0, 1):
+        return {"status": "completed", "findings": findings, "error": ""}
+    return {"status": "optional_unavailable", "findings": [], "error": res["stderr"][:300]}
+
+
+async def run_codeql(workspace_dir: Path, targets: list[str]) -> dict[str, Any]:
+    """Optional CodeQL SARIF analyzer when `codeql` CLI and language packs are installed."""
+    codeql_bin = resolve_binary("codeql")
+    if not codeql_bin:
+        return {"status": "optional_unavailable", "findings": [], "error": ""}
+    py_present = any(t.endswith(".py") for t in targets)
+    js_present = any(t.endswith((".ts", ".tsx", ".js", ".jsx")) for t in targets)
+    lang = "python" if py_present else ("javascript" if js_present else "")
+    if not lang:
+        return {"status": "skipped_no_supported_files", "findings": [], "error": ""}
+
+    with tempfile.TemporaryDirectory(prefix="swarm_codeql_") as tmp_dir:
+        db_dir = Path(tmp_dir) / "db"
+        sarif_path = Path(tmp_dir) / "out.sarif"
+        create_res = await run_command_capture(
+            [codeql_bin, "database", "create", str(db_dir), f"--language={lang}", f"--source-root={workspace_dir}"],
+            cwd=workspace_dir,
+            timeout=120,
+        )
+        if create_res["returncode"] != 0:
+            return {"status": "optional_unavailable", "findings": [], "error": create_res["stderr"][:300]}
+        analyze_res = await run_command_capture(
+            [codeql_bin, "database", "analyze", str(db_dir), "--format=sarif-latest", f"--output={sarif_path}"],
+            cwd=workspace_dir,
+            timeout=120,
+        )
+        if analyze_res["returncode"] != 0 or not sarif_path.exists():
+            return {"status": "optional_unavailable", "findings": [], "error": analyze_res["stderr"][:300]}
+        findings: list[dict[str, Any]] = []
+        try:
+            sarif = json.loads(sarif_path.read_text(encoding="utf-8"))
+            for run in sarif.get("runs", []) or []:
+                for r in run.get("results", []) or []:
+                    locs = r.get("locations") or []
+                    phys = (locs[0].get("physicalLocation") or {}) if locs else {}
+                    uri = ((phys.get("artifactLocation") or {}).get("uri") or "").lstrip("./")
+                    start_line = (phys.get("region") or {}).get("startLine") or 1
+                    findings.append(
+                        {
+                            "tool": "codeql",
+                            "rule_id": r.get("ruleId", "CODEQL"),
+                            "title": f"CodeQL: {r.get('ruleId', 'Finding')}",
+                            "file_path": _rel_path(workspace_dir, uri),
+                            "line_number": start_line,
+                            "severity": "High" if r.get("level") == "error" else "Medium",
+                            "evidence": ((r.get("message") or {}).get("text") or "")[:240],
+                            "description": ((r.get("message") or {}).get("text") or "")[:300],
+                        }
+                    )
+        except (OSError, json.JSONDecodeError):
+            return {"status": "optional_unavailable", "findings": [], "error": "Failed to parse CodeQL SARIF"}
+        return {"status": "completed", "findings": findings[:40], "error": ""}
+
+
 async def _skipped_by_plan_result(note: str) -> dict[str, Any]:
     return {"status": "skipped_by_plan", "findings": [], "error": "", "note": note}
 
@@ -317,6 +424,7 @@ async def run_security_scanners(
     commit_context: str = "HEAD",
     config_hash: str = "default",
     plan: dict[str, Any] | None = None,
+    structure_index: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     import asyncio
 
@@ -329,6 +437,9 @@ async def run_security_scanners(
             "gitleaks": dict(skipped),
             "osv_scanner": dict(skipped),
             "deterministic_guards": dict(skipped),
+            "taint_analysis": dict(skipped),
+            "codeql": dict(skipped),
+            "trivy": dict(skipped),
             "cache_hit": False,
         }
 
@@ -352,11 +463,13 @@ async def run_security_scanners(
     tool_version = ""
     if cache is not None and cache_targets:
         content_hash = hash_files_content(workspace_dir, cache_targets)
-        vb, vs, vg, vo = await asyncio.gather(
+        vb, vs, vg, vo, vt, vc = await asyncio.gather(
             get_tool_version("bandit"),
             get_tool_version("semgrep"),
             get_tool_version("gitleaks", ("version",)),
             get_tool_version("osv-scanner"),
+            get_tool_version("trivy"),
+            get_tool_version("codeql"),
         )
         rules_digest = (
             hash_text(LOCAL_SEMGREP_RULES.read_text(encoding="utf-8", errors="replace"))[:12]
@@ -364,7 +477,9 @@ async def run_security_scanners(
             else "norules"
         )
         plan_flags = hash_text(json.dumps(plan or {}, sort_keys=True, default=str))[:12]
-        tool_version = f"{SCANNER_CACHE_SCHEMA_VERSION}|b={vb}|s={vs}|g={vg}|o={vo}|r={rules_digest}|p={plan_flags}"
+        tool_version = (
+            f"{SCANNER_CACHE_SCHEMA_VERSION}|b={vb}|s={vs}|g={vg}|o={vo}|t={vt}|c={vc}|r={rules_digest}|p={plan_flags}"
+        )
         cached = cache.get(
             "security_scanners",
             content_hash=content_hash,
@@ -379,8 +494,11 @@ async def run_security_scanners(
     run_semgrep_flag = plan.get("run_semgrep", True) if plan else True
     run_gitleaks_flag = plan.get("run_gitleaks", True) if plan else True
     run_osv_flag = plan.get("run_osv", True) if plan else True
+    run_taint_flag = plan.get("run_taint", True) if plan else True
+    run_codeql_flag = plan.get("run_codeql", False) if plan else False
+    run_trivy_flag = plan.get("run_trivy", False) if plan else False
 
-    bandit_res, semgrep_res, gitleaks_res, osv_res, guards_res = await asyncio.gather(
+    bandit_res, semgrep_res, gitleaks_res, osv_res, guards_res, codeql_res, trivy_res = await asyncio.gather(
         run_bandit(workspace_dir, changed_file_paths)
         if run_bandit_flag
         else _skipped_by_plan_result("No Python changes in diff"),
@@ -394,6 +512,17 @@ async def run_security_scanners(
         if run_osv_flag
         else _skipped_by_plan_result("Skipped by ReviewPlanner"),
         run_deterministic_code_guards(workspace_dir, changed_file_paths),
+        run_codeql(workspace_dir, changed_file_paths)
+        if run_codeql_flag
+        else _skipped_by_plan_result("Skipped for medium/low risk plan"),
+        run_trivy(workspace_dir)
+        if run_trivy_flag
+        else _skipped_by_plan_result("Skipped when no dependency/high-risk trigger"),
+    )
+    taint_res = (
+        run_taint_and_threat_analysis(workspace_dir, changed_file_paths, structure_index=structure_index)
+        if run_taint_flag
+        else {"status": "skipped_by_plan", "findings": [], "threat_surfaces": [], "error": ""}
     )
     payload = {
         "bandit": bandit_res,
@@ -401,8 +530,17 @@ async def run_security_scanners(
         "gitleaks": gitleaks_res,
         "osv_scanner": osv_res,
         "deterministic_guards": guards_res,
+        "taint_analysis": taint_res,
+        "codeql": codeql_res,
+        "trivy": trivy_res,
     }
-    cacheable_statuses = {"completed", "skipped_by_plan", "tool_unavailable"}
+    cacheable_statuses = {
+        "completed",
+        "skipped_by_plan",
+        "tool_unavailable",
+        "optional_unavailable",
+        "skipped_no_supported_files",
+    }
     all_clean = all(
         str(v.get("status", "")) in cacheable_statuses
         for v in payload.values()

@@ -12,9 +12,9 @@ const LLM_PIPELINE = [
     phase: "Fan-Out (Parallel)",
     model: "deepseek-flash",
     inputs:
-      "Commit diff + STAIR hierarchical symbol/dependency slices (3,000-token budget) + AST changed-symbol & defensive-guard facts.",
+      "Commit diff + base-vs-target AST diff (semantic rename vs algorithm/permission edit, API contract & config impact) + STAIR caller/dependency slices (3,000-token cap).",
     output:
-      "Explains behavioral impact, semantic diffs, and API contract drift anchored to exact symbols, callers, and line numbers.",
+      "Explains behavioral impact, API drift, and downstream consumer risk anchored to exact symbols, callers, and line numbers.",
   },
   {
     key: "style_agent",
@@ -22,9 +22,9 @@ const LLM_PIPELINE = [
     phase: "Fan-Out (Parallel)",
     model: "deepseek-flash",
     inputs:
-      "Incremental cached Ruff lints, Python AST complexity, Node TS syntax parse results, duplicate blocks, and STAIR complexity slices (2,000-token budget).",
+      "Cached Ruff, ESLint & Pylint (when installed), AST deep-nesting/long-function/coupling/dead-code checks, repo naming conventions, and STAIR slices (2,000-token cap).",
     output:
-      "Surfaces broken syntax, high-complexity modules, duplication, and local refactoring fixes with honest confidence scores.",
+      "Surfaces exact linter/dead-code hits deterministically and skips the LLM call whenever lints are clean/unambiguous (saving tokens).",
   },
   {
     key: "security_agent",
@@ -32,9 +32,9 @@ const LLM_PIPELINE = [
     phase: "Fan-Out (Parallel)",
     model: "deepseek-v4-pro",
     inputs:
-      "Cached Semgrep, Bandit, Gitleaks, OSV-Scanner CVEs, SSRF/auth guards + STAIR caller/callee & guard slices (5,000-token budget, +30% on High Risk).",
+      "Cached Semgrep, Bandit, Gitleaks, OSV-Scanner, deterministic taint/data-flow/authz/crypto analyzer, optional CodeQL/Trivy + STAIR slices (5,000-token cap, +30% High Risk).",
     output:
-      "Audits source-to-sink paths and auth boundaries without falsely flagging guards implemented elsewhere in the module or test fixtures.",
+      "Traces source-to-sink exploitability across trust boundaries while skipping deep LLM scans on clean/low-risk non-code changes.",
   },
   {
     key: "test_coverage_agent",
@@ -42,9 +42,9 @@ const LLM_PIPELINE = [
     phase: "Fan-Out (Parallel)",
     model: "deepseek-flash",
     inputs:
-      "Pytest/Vitest execution results, Coverage.py lines, Cross-File Test-Import Map, and STAIR linked test/symbol slices (3,500-token budget).",
+      "Change-impact selective Pytest/Vitest runner, failure triage (code vs env/dep), Coverage.py lines, test-import map, and Hypothesis/Mutmut candidate detector (3,500-token cap).",
     output:
-      "Reports real test failures or untested changed symbols rather than guessing coverage from filenames alone.",
+      "Isolates failing/untested changed symbols without falsely claiming tests ran when only static code inspection occurred.",
   },
   {
     key: "reviewer_manager",
@@ -52,19 +52,19 @@ const LLM_PIPELINE = [
     phase: "Fan-In + EvidenceGuard",
     model: "deepseek-v4-pro",
     inputs:
-      "All 4 specialist outputs + independent EvidenceGuard Store (EV-NNN provenance IDs) + STAIR verification slices (3,000-token budget, +30% on High Risk).",
+      "All 4 specialist outputs + immutable EV-NNN EvidenceStore + capability/permission enforcement + cross-agent contradiction detector + STAIR slices (3,000-token cap).",
     output:
-      "Blocks LLM self-certified Verified tags, enforces exact (file, tool/rule, line) attribution, rejects contradicted claims, and computes the verdict.",
+      "Blocks fabricated Verified tags & unauthorized test-execution claims, calibrates confidence separately, normalizes severity, and computes the deterministic verdict.",
   },
   {
     key: "fix_suggestion_agent",
     name: "6. Fix-Suggestion Agent",
-    phase: "Patch Validation",
+    phase: "Isolated Patch Sandbox",
     model: "deepseek-v4-pro",
     inputs:
-      "Strictly EvidenceGuard-Verified defects (EV-NNN backed) + STAIR caller/dependency context (4,000-token budget) + covering test contracts.",
+      "Strictly EvidenceGuard-Verified defects (EV-NNN backed) + stale-hash conflict guard + STAIR context (4,000-token cap) + regression test hints.",
     output:
-      "Generates minimal unified diffs verified by git apply --check, syntax parsers, and security-guard regression checks. Human approval is always required.",
+      "Generates minimal patches validated in an isolated temp copy via git apply --check, AST/Node syntax, optional mypy/tsc type-checks, security+taint rescan, and targeted tests.",
   },
 ];
 

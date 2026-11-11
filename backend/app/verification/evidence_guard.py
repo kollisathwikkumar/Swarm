@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from app.services.git_workspace import resolve_within_dir
+from app.skills.permissions import enforce_agent_permissions
 
 DETERMINISTIC_TOOL_NAMES = {
     "bandit",
@@ -13,17 +14,28 @@ DETERMINISTIC_TOOL_NAMES = {
     "gitleaks",
     "osv-scanner",
     "security-guard",
+    "security-taint",
+    "codeql",
+    "trivy",
     "ruff",
+    "eslint",
+    "pylint",
     "ast-complexity",
     "ast-style-checker",
     "js-style-checker",
     "duplicate-detector",
+    "dead-code-analyzer",
     "python-ast",
     "ts-syntax-checker",
+    "mypy",
+    "tsc",
+    "diff-ast-engine",
     "pytest",
     "vitest",
     "coverage.py",
     "test-mapper",
+    "hypothesis",
+    "mutmut",
 }
 
 LLM_ONLY_TOOLS = {
@@ -162,11 +174,36 @@ def build_evidence_store(
         tr = _read_agent_value(res, "tool_results") or {}
         if agent_name == "diff_agent":
             extras["polyglot_symbols"] = tr.get("polyglot_symbols") or tr.get("python_ast_symbols") or {}
+            extras["ast_diff"] = tr.get("ast_diff") or {}
+            for item in (tr.get("ast_diff") or {}).get("findings", []) or []:
+                _add_record(
+                    tool_name=str(item.get("tool") or "diff-ast-engine"),
+                    rule_id=str(item.get("rule_id") or "DIFF-API-CONTRACT"),
+                    file_path=str(item.get("file_path") or "").strip(),
+                    line_number=item.get("line_number"),
+                    end_line=None,
+                    snippet=str(item.get("evidence") or item.get("title") or ""),
+                    severity=str(item.get("severity") or "Medium"),
+                )
         elif agent_name == "security_agent":
-            for key in ("bandit", "semgrep", "gitleaks", "osv_scanner", "deterministic_guards"):
+            for key in (
+                "bandit",
+                "semgrep",
+                "gitleaks",
+                "osv_scanner",
+                "deterministic_guards",
+                "taint_analysis",
+                "codeql",
+                "trivy",
+            ):
                 for item in (tr.get(key) or {}).get("findings", []) or []:
                     tname = str(
-                        item.get("tool") or ("security-guard" if key == "deterministic_guards" else key.replace("_", "-"))
+                        item.get("tool")
+                        or (
+                            "security-guard"
+                            if key == "deterministic_guards"
+                            else ("security-taint" if key == "taint_analysis" else key.replace("_", "-"))
+                        )
                     )
                     fp = str(item.get("file_path") or "").strip()
                     _add_record(
@@ -183,9 +220,9 @@ def build_evidence_store(
                         },
                     )
         elif agent_name == "style_agent":
-            for section in ("ruff", "ast_checks"):
+            for section in ("ruff", "eslint", "pylint", "dead_code", "ast_checks"):
                 for item in (tr.get(section) or {}).get("findings", []) or []:
-                    tname = str(item.get("tool") or "ruff")
+                    tname = str(item.get("tool") or section.replace("_", "-"))
                     fp = str(item.get("file_path") or "").strip()
                     _add_record(
                         tool_name=tname,
@@ -199,7 +236,13 @@ def build_evidence_store(
         elif agent_name == "test_coverage_agent":
             extras["test_import_map"] = tr.get("test_import_map") or {}
             extras["test_runner"] = str(tr.get("runner") or "")
+            extras["test_runner_status"] = str(tr.get("status") or "")
             extras["tests_failed"] = int(tr.get("failed") or 0)
+            extras["test_telemetry"] = {
+                "runner": extras["test_runner"],
+                "status": extras["test_runner_status"],
+                "failed": extras["tests_failed"],
+            }
             src_map = (extras["test_import_map"] or {}).get("source_file_test_map") or {}
             for fp, info in src_map.items():
                 cov_st = info.get("coverage_status")
@@ -272,19 +315,34 @@ def _clamp_confidence(raw_conf: Any, default: float) -> float:
     return round(min(1.0, max(0.0, val)), 2)
 
 
+_AGENT_KEY_BY_LABEL = {
+    "Diff Agent": "diff_agent",
+    "Style Agent": "style_agent",
+    "Security Agent": "security_agent",
+    "Test-Coverage Agent": "test_coverage_agent",
+    "Reviewer Manager": "reviewer_manager",
+    "Fix-Suggestion Agent": "fix_suggestion_agent",
+}
+
+
 def verify_finding_provenance(
     finding: dict[str, Any],
     evidence_store: list[EvidenceRecord],
     workspace_dir: Path,
     *,
     line_tolerance: int = 3,
+    execution_telemetry: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """
-    Independently verify a candidate finding against disk files + immutable EvidenceStore.
-    Returns `(normalized_finding, fabricated_tool_claim)`.
+    Independently verify a candidate finding against disk files + immutable EvidenceStore + permission boundaries.
+    Returns `(normalized_finding, fabricated_or_unauthorized_claim)`.
     An LLM can never self-certify `Verified`: only exact `(file_path, tool/rule, line_range)` matches succeed.
     """
     out = dict(finding)
+    raw_agent = str(out.get("agent") or "Reviewer Manager")
+    agent_key = _AGENT_KEY_BY_LABEL.get(raw_agent, raw_agent.lower().replace(" ", "_"))
+    out, perm_violations = enforce_agent_permissions(agent_key, out, execution_telemetry)
+
     fp = str(out.get("file_path") or "").strip()
     ln = out.get("line_number")
     line_int = int(ln) if isinstance(ln, int) and ln > 0 else None
@@ -297,10 +355,15 @@ def verify_finding_provenance(
         out["verification_status"] = "Unverified"
         out["evidence_ids"] = []
         out["confidence"] = _clamp_confidence(out.get("confidence"), 0.25)
-        return out, claimed_tool in DETERMINISTIC_TOOL_NAMES
+        return out, bool(perm_violations or claimed_tool in DETERMINISTIC_TOOL_NAMES)
 
     if actual_line and not out.get("evidence"):
         out["evidence"] = actual_line
+
+    if perm_violations:
+        out["permission_violations"] = perm_violations
+        out["confidence"] = _clamp_confidence(out.get("confidence"), 0.4)
+        return out, True
 
     matched_records: list[EvidenceRecord] = []
     for rec in evidence_store:
@@ -332,6 +395,51 @@ def verify_finding_provenance(
     default_conf = 0.65 if claimed_tool in LLM_ONLY_TOOLS and exists else 0.45
     out["confidence"] = _clamp_confidence(out.get("confidence"), default_conf)
     return out, fabricated
+
+
+def normalize_severity_with_criteria(finding: dict[str, Any]) -> str:
+    """Consistent deterministic severity normalization across agents."""
+    sev = str(finding.get("severity") or "Medium").strip().title()
+    rule = str(finding.get("rule_id") or "").upper()
+    tool = str(finding.get("tool_name") or "").lower()
+    if finding.get("is_test_fixture"):
+        return "Low"
+    if rule in ("TAINT-SQL-INJECTION", "TAINT-CMD-INJECTION"):
+        return "Critical"
+    if rule in ("SYNTAX-ERROR", "SYNTAX-INVALID-SOURCE", "TAINT-PATH-TRAVERSAL", "CRYPTO-INSECURE-RANDOM"):
+        return "High" if sev in ("Low", "Medium") else sev
+    if tool == "dead-code-analyzer" and rule == "DEAD-UNUSED-PRIVATE-SYMBOL":
+        return "Low"
+    return sev if sev in ("Critical", "High", "Medium", "Low") else "Medium"
+
+
+def detect_cross_agent_contradictions(
+    findings: list[dict[str, Any]], extras: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Detect conflicting claims across specialists on the same file or test status."""
+    contradictions: list[dict[str, Any]] = []
+    by_file: dict[str, list[dict[str, Any]]] = {}
+    for f in findings:
+        fp = str(f.get("file_path") or "").strip()
+        if fp:
+            by_file.setdefault(fp, []).append(f)
+
+    for fp, items in by_file.items():
+        if len(items) < 2:
+            continue
+        agents = {str(it.get("agent") or "") for it in items}
+        texts = [f"{it.get('title', '')} {it.get('description', '')}".lower() for it in items]
+        has_missing_cov = any("untested" in t or "no tests" in t for t in texts)
+        tmap = ((extras.get("test_import_map") or {}).get("source_file_test_map") or {}).get(fp) or {}
+        if has_missing_cov and tmap.get("has_any_unmocked_test"):
+            contradictions.append(
+                {
+                    "file_path": fp,
+                    "agents": sorted(agents),
+                    "reason": f"Agent claimed `{fp}` has no tests, contradicting Test-Import Map ({tmap.get('coverage_status')}).",
+                }
+            )
+    return contradictions
 
 
 def check_finding_contradiction(finding: dict[str, Any], extras: dict[str, Any]) -> str | None:

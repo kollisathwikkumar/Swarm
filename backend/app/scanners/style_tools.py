@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -12,13 +13,147 @@ from app.cache.review_cache import (
     hash_files_content,
 )
 from app.scanners.code_engines import prioritize_repo_files, verify_code_syntax
-from app.scanners.tool_runner import get_tool_version, resolve_binary, run_command_capture
+from app.scanners.tool_runner import (
+    get_tool_version,
+    resolve_binary,
+    resolve_workspace_binary,
+    run_command_capture,
+)
+
+_CAMEL_NAME_RE = re.compile(r"^[a-z]+[A-Z][A-Za-z0-9]*$")
+_SNAKE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+
+
+def _max_control_depth(node: ast.AST, depth: int = 0) -> int:
+    max_d = depth
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.Try)):
+            max_d = max(max_d, _max_control_depth(child, depth + 1))
+        else:
+            max_d = max(max_d, _max_control_depth(child, depth))
+    return max_d
+
+
+def _check_unreachable_in_block(stmts: list[ast.stmt], rel_path: str, out: list[dict[str, Any]]) -> None:
+    term_idx: int | None = None
+    for idx, stmt in enumerate(stmts):
+        if isinstance(stmt, (ast.Return, ast.Raise, ast.Break, ast.Continue)):
+            term_idx = idx
+            break
+    if term_idx is not None and term_idx + 1 < len(stmts):
+        dead_stmt = stmts[term_idx + 1]
+        out.append(
+            {
+                "tool": "dead-code-analyzer",
+                "rule_id": "DEAD-UNREACHABLE-CODE",
+                "file_path": rel_path,
+                "line_number": getattr(dead_stmt, "lineno", 1),
+                "severity": "Medium",
+                "message": f"Unreachable statement at line {getattr(dead_stmt, 'lineno', 1)} after return/raise/break/continue.",
+            }
+        )
+    for stmt in stmts:
+        for attr in ("body", "orelse", "finalbody"):
+            sub = getattr(stmt, attr, None)
+            if isinstance(sub, list) and sub and all(isinstance(s, ast.stmt) for s in sub):
+                _check_unreachable_in_block(sub, rel_path, out)
+
+
+def _check_dead_and_conventions(
+    rel_path: str,
+    tree: ast.Module,
+    src: str,
+    structure_index: dict[str, Any] | None,
+    style_issues: list[dict[str, Any]],
+    dead_code: list[dict[str, Any]],
+) -> None:
+    # Unreachable code blocks inside functions and module body
+    _check_unreachable_in_block(tree.body, rel_path, dead_code)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            _check_unreachable_in_block(node.body, rel_path, dead_code)
+
+    # Unreferenced module-private helper functions (`_helper` defined without @decorator and never referenced)
+    used_names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)} | {
+        n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)
+    }
+    for node in tree.body:
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name.startswith("_")
+            and not node.name.startswith("__")
+            and not node.decorator_list
+            and node.name not in used_names
+            and f"{node.name}" not in src.replace(f"def {node.name}", "")
+        ):
+            dead_code.append(
+                {
+                    "tool": "dead-code-analyzer",
+                    "rule_id": "DEAD-UNUSED-PRIVATE-SYMBOL",
+                    "file_path": rel_path,
+                    "line_number": node.lineno,
+                    "severity": "Low",
+                    "message": f"Private function `{node.name}` appears unreferenced within `{rel_path}`.",
+                }
+            )
+
+    # Existing-pattern & naming convention checks against repository StructureIndex
+    if structure_index:
+        symbol_by_id = structure_index.get("symbol_by_id") or {}
+        py_names = [
+            str(s.get("name") or "")
+            for s in symbol_by_id.values()
+            if str(s.get("file_path") or "").endswith(".py")
+            and isinstance(s.get("name"), str)
+            and "." not in str(s.get("name"))
+            and not str(s.get("name")).startswith("_")
+        ]
+        snake_cnt = sum(1 for n in py_names if _SNAKE_NAME_RE.match(n))
+        camel_cnt = sum(1 for n in py_names if _CAMEL_NAME_RE.match(n))
+        repo_prefers_snake = snake_cnt >= max(3, camel_cnt * 2)
+
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not node.name.startswith("_"):
+                if repo_prefers_snake and _CAMEL_NAME_RE.match(node.name):
+                    style_issues.append(
+                        {
+                            "tool": "ast-style-checker",
+                            "rule_id": "STYLE-NAMING-CONVENTION",
+                            "file_path": rel_path,
+                            "line_number": node.lineno,
+                            "severity": "Low",
+                            "message": f"Function `{node.name}` uses camelCase while repository Python convention is snake_case.",
+                        }
+                    )
+                # Check existing-pattern duplicate helper across other modules
+                other_matches = [
+                    s["file_path"]
+                    for s in symbol_by_id.values()
+                    if s.get("name") == node.name
+                    and s.get("file_path") != rel_path
+                    and not str(s.get("file_path") or "").endswith((".test.py", "_test.py"))
+                ]
+                if other_matches and len(node.name) >= 8:
+                    style_issues.append(
+                        {
+                            "tool": "ast-style-checker",
+                            "rule_id": "STYLE-EXISTING-PATTERN",
+                            "file_path": rel_path,
+                            "line_number": node.lineno,
+                            "severity": "Low",
+                            "message": f"Helper `{node.name}` mirrors an existing symbol in `{other_matches[0]}`; check whether the shared helper can be reused.",
+                        }
+                    )
 
 
 def _analyze_code_style_and_duplicates(
-    workspace_dir: Path, target_files: list[str]
+    workspace_dir: Path,
+    target_files: list[str],
+    *,
+    structure_index: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     style_issues: list[dict[str, Any]] = []
+    dead_code: list[dict[str, Any]] = []
     block_hashes: dict[str, list[tuple[str, int]]] = {}
 
     code_exts = (".py", ".ts", ".tsx", ".js", ".jsx")
@@ -79,8 +214,46 @@ def _analyze_code_style_and_duplicates(
         if rel.endswith(".py"):
             try:
                 tree = ast.parse(source)
+                import_count = sum(
+                    1 for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom))
+                )
+                if import_count >= 15:
+                    style_issues.append(
+                        {
+                            "tool": "ast-complexity",
+                            "rule_id": "STYLE-HIGH-COUPLING",
+                            "file_path": rel,
+                            "line_number": 1,
+                            "severity": "Low",
+                            "message": f"High module coupling ({import_count} import statements); consider splitting responsibilities.",
+                        }
+                    )
                 for node in ast.walk(tree):
                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        fn_len = (getattr(node, "end_lineno", node.lineno) or node.lineno) - node.lineno + 1
+                        if fn_len > 60:
+                            style_issues.append(
+                                {
+                                    "tool": "ast-complexity",
+                                    "rule_id": "STYLE-LONG-FUNCTION",
+                                    "file_path": rel,
+                                    "line_number": node.lineno,
+                                    "severity": "Medium",
+                                    "message": f"Function '{node.name}' spans {fn_len} lines (>60); extract focused helpers.",
+                                }
+                            )
+                        depth = _max_control_depth(node)
+                        if depth >= 4:
+                            style_issues.append(
+                                {
+                                    "tool": "ast-complexity",
+                                    "rule_id": "STYLE-DEEP-NESTING",
+                                    "file_path": rel,
+                                    "line_number": node.lineno,
+                                    "severity": "Medium",
+                                    "message": f"Function '{node.name}' has deep control-flow nesting (depth={depth}); use early returns.",
+                                }
+                            )
                         branches = sum(
                             1
                             for child in ast.walk(node)
@@ -100,6 +273,7 @@ def _analyze_code_style_and_duplicates(
                                     "message": f"Function '{node.name}' has high branch complexity ({branches} branch nodes).",
                                 }
                             )
+                _check_dead_and_conventions(rel, tree, source, structure_index, style_issues, dead_code)
             except SyntaxError as exc:
                 style_issues.append(
                     {
@@ -167,7 +341,92 @@ def _analyze_code_style_and_duplicates(
                 }
             )
 
-    return {"complexity_and_style": style_issues[:25], "duplicates": duplicates[:15]}
+    return {
+        "complexity_and_style": style_issues[:35],
+        "duplicates": duplicates[:15],
+        "dead_code": dead_code[:25],
+    }
+
+
+async def run_eslint(workspace_dir: Path, targets: list[str]) -> dict[str, Any]:
+    """Optional ESLint JSON runner preferring repo-local node_modules/.bin/eslint."""
+    js_targets = [t for t in targets if t.endswith((".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"))]
+    if not js_targets:
+        return {"status": "skipped_no_js_files", "findings": [], "error": ""}
+    eslint_bin = resolve_workspace_binary(workspace_dir, "eslint")
+    if not eslint_bin:
+        return {"status": "optional_unavailable", "findings": [], "error": ""}
+    res = await run_command_capture(
+        [eslint_bin, "--format", "json", *js_targets[:25]],
+        cwd=workspace_dir,
+        timeout=60,
+    )
+    findings: list[dict[str, Any]] = []
+    if res["stdout"].strip():
+        try:
+            items = json.loads(res["stdout"])
+            for entry in items:
+                raw_fp = str(entry.get("filePath") or "")
+                try:
+                    rel_fp = str(Path(raw_fp).resolve().relative_to(workspace_dir.resolve()))
+                except ValueError:
+                    rel_fp = raw_fp
+                for msg in entry.get("messages", []) or []:
+                    if not msg.get("ruleId"):
+                        continue
+                    findings.append(
+                        {
+                            "tool": "eslint",
+                            "rule_id": str(msg["ruleId"]),
+                            "file_path": rel_fp,
+                            "line_number": int(msg.get("line") or 1),
+                            "end_line": msg.get("endLine"),
+                            "severity": "High" if int(msg.get("severity") or 1) >= 2 else "Medium",
+                            "message": str(msg.get("message") or "ESLint violation")[:240],
+                        }
+                    )
+            return {"status": "completed", "findings": findings[:35], "error": ""}
+        except json.JSONDecodeError:
+            pass
+    if res["returncode"] in (0, 1):
+        return {"status": "completed", "findings": findings, "error": ""}
+    return {"status": "optional_unavailable", "findings": [], "error": res["stderr"][:300]}
+
+
+async def run_pylint(workspace_dir: Path, targets: list[str]) -> dict[str, Any]:
+    """Optional Pylint JSON runner when installed."""
+    py_targets = [t for t in targets if t.endswith(".py") and (workspace_dir / t).exists()]
+    if not py_targets:
+        return {"status": "skipped_no_python_files", "findings": [], "error": ""}
+    pylint_bin = resolve_workspace_binary(workspace_dir, "pylint")
+    if not pylint_bin:
+        return {"status": "optional_unavailable", "findings": [], "error": ""}
+    res = await run_command_capture(
+        [pylint_bin, "--output-format=json", "--score=n", *py_targets[:20]],
+        cwd=workspace_dir,
+        timeout=60,
+    )
+    findings: list[dict[str, Any]] = []
+    if res["stdout"].strip():
+        try:
+            raw = json.loads(res["stdout"])
+            for item in raw:
+                msg_type = str(item.get("type") or "warning").lower()
+                findings.append(
+                    {
+                        "tool": "pylint",
+                        "rule_id": str(item.get("message-id") or item.get("symbol") or "PYLINT"),
+                        "file_path": str(item.get("path") or ""),
+                        "line_number": int(item.get("line") or 1),
+                        "end_line": item.get("endLine"),
+                        "severity": "High" if msg_type in ("error", "fatal") else "Medium" if msg_type == "warning" else "Low",
+                        "message": str(item.get("message") or "Pylint finding")[:240],
+                    }
+                )
+            return {"status": "completed", "findings": findings[:35], "error": ""}
+        except json.JSONDecodeError:
+            pass
+    return {"status": "completed", "findings": findings, "error": ""}
 
 
 async def run_style_scanners(
@@ -178,6 +437,7 @@ async def run_style_scanners(
     commit_context: str = "HEAD",
     config_hash: str = "default",
     plan: dict[str, Any] | None = None,
+    structure_index: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if plan and plan.get("skip_scanners"):
         return {
@@ -187,6 +447,9 @@ async def run_style_scanners(
                 "findings": [],
                 "note": "Skipped by ReviewPlanner (low-risk/docs-only change)",
             },
+            "eslint": {"status": "skipped_by_plan", "error": "", "findings": []},
+            "pylint": {"status": "skipped_by_plan", "error": "", "findings": []},
+            "dead_code": {"status": "skipped_by_plan", "findings": []},
             "ast_checks": {
                 "status": "skipped_by_plan",
                 "findings": [],
@@ -279,7 +542,19 @@ async def run_style_scanners(
         ruff_status = "tool_unavailable"
         ruff_error = "ruff binary not found"
 
-    ast_res = _analyze_code_style_and_duplicates(workspace_dir, existing_targets)
+    eslint_res = (
+        await run_eslint(workspace_dir, existing_targets)
+        if (plan.get("run_eslint", True) if plan else True)
+        else {"status": "skipped_by_plan", "findings": [], "error": ""}
+    )
+    pylint_res = (
+        await run_pylint(workspace_dir, existing_targets)
+        if (plan.get("run_pylint", True) if plan else True)
+        else {"status": "skipped_by_plan", "findings": [], "error": ""}
+    )
+    ast_res = _analyze_code_style_and_duplicates(
+        workspace_dir, existing_targets, structure_index=structure_index
+    )
 
     # Run Node/TypeScript syntax verification on changed JS/TS files so broken syntax is always caught deterministically
     for rel in prioritize_repo_files(existing_targets)[:20]:
@@ -305,6 +580,12 @@ async def run_style_scanners(
             "status": ruff_status,
             "error": ruff_error,
             "findings": ruff_findings,
+        },
+        "eslint": eslint_res,
+        "pylint": pylint_res,
+        "dead_code": {
+            "status": "completed",
+            "findings": ast_res["dead_code"],
         },
         "ast_checks": {
             "status": "completed",

@@ -18,6 +18,8 @@ from app.skills.shared_contracts import format_agent_contract
 from app.verification.evidence_guard import (
     build_evidence_store,
     check_finding_contradiction,
+    detect_cross_agent_contradictions,
+    normalize_severity_with_criteria,
     verify_finding_provenance,
 )
 
@@ -81,6 +83,24 @@ Return strict JSON:
 }"""
 
 
+_PRIMARY_TOOL_RANK = {
+    "bandit": 0,
+    "semgrep": 1,
+    "gitleaks": 2,
+    "osv-scanner": 3,
+    "codeql": 4,
+    "trivy": 5,
+    "ruff": 6,
+    "eslint": 7,
+    "pylint": 8,
+    "pytest": 9,
+    "vitest": 10,
+    "security-taint": 15,
+    "security-guard": 16,
+    "diff-ast-engine": 17,
+}
+
+
 def _deterministic_deduplicate(raw_findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     merged: dict[tuple[str, int, str], dict[str, Any]] = {}
     for f in raw_findings:
@@ -112,6 +132,13 @@ def _deterministic_deduplicate(raw_findings: list[dict[str, Any]]) -> list[dict[
                 if eid not in existing["evidence_ids"]:
                     existing["evidence_ids"].append(eid)
             existing["confidence"] = max(float(existing.get("confidence", 0.5)), conf)
+            # Prefer industry-primary SAST/linter tool_name when merging same-line duplicates
+            cur_tool = str(existing.get("tool_name") or "")
+            new_tool = str(f.get("tool_name") or "")
+            if _PRIMARY_TOOL_RANK.get(new_tool, 99) < _PRIMARY_TOOL_RANK.get(cur_tool, 99):
+                existing["tool_name"] = new_tool
+                if f.get("rule_id"):
+                    existing["rule_id"] = f["rule_id"]
             if SEVERITY_ORDER.get(sev, 3) < SEVERITY_ORDER.get(
                 str(existing.get("severity") or "Low").title(), 3
             ):
@@ -257,28 +284,80 @@ class ReviewerManagerExecutor(Executor):
         }
         for res in results:
             tr = res.tool_results or {}
-            if res.agent_name == "security_agent":
-                guard_items = (tr.get("deterministic_guards") or {}).get("findings", []) or []
-                for item in guard_items:
+            if res.agent_name == "diff_agent":
+                for item in (tr.get("ast_diff") or {}).get("findings", []) or []:
                     sig = (str(item.get("file_path") or ""), int(item.get("line_number") or 0), str(item.get("rule_id") or ""))
                     if sig not in existing_sig:
+                        existing_sig.add(sig)
                         all_raw_findings.append(
                             {
-                                "agent": "Security Agent",
-                                "category": "security",
+                                "agent": "Diff Agent",
+                                "category": "change_risk",
                                 "severity": item.get("severity", "Medium"),
-                                "title": item.get("title", "Deterministic Security Guard Finding"),
-                                "description": item.get("description", ""),
+                                "title": item.get("title", "API Contract Change"),
+                                "description": item.get("evidence", ""),
                                 "file_path": item.get("file_path", ""),
                                 "line_number": item.get("line_number"),
                                 "end_line": None,
                                 "evidence": item.get("evidence", ""),
-                                "recommendation": item.get("description", "Remediate detected guard gap."),
+                                "recommendation": "Verify downstream callers match the updated signature or interface.",
                                 "verification_status": "Verified",
-                                "tool_name": "security-guard",
+                                "tool_name": item.get("tool", "diff-ast-engine"),
                                 "rule_id": item.get("rule_id"),
                             }
                         )
+            elif res.agent_name == "security_agent":
+                for sec_key, def_tool in (
+                    ("deterministic_guards", "security-guard"),
+                    ("taint_analysis", "security-taint"),
+                    ("codeql", "codeql"),
+                    ("trivy", "trivy"),
+                ):
+                    guard_items = (tr.get(sec_key) or {}).get("findings", []) or []
+                    for item in guard_items:
+                        sig = (str(item.get("file_path") or ""), int(item.get("line_number") or 0), str(item.get("rule_id") or ""))
+                        if sig not in existing_sig:
+                            existing_sig.add(sig)
+                            all_raw_findings.append(
+                                {
+                                    "agent": "Security Agent",
+                                    "category": "security",
+                                    "severity": item.get("severity", "Medium"),
+                                    "title": item.get("title", "Deterministic Security Finding"),
+                                    "description": item.get("description", ""),
+                                    "file_path": item.get("file_path", ""),
+                                    "line_number": item.get("line_number"),
+                                    "end_line": None,
+                                    "evidence": item.get("evidence", ""),
+                                    "recommendation": item.get("description", "Remediate detected vulnerability."),
+                                    "verification_status": "Verified",
+                                    "tool_name": item.get("tool", def_tool),
+                                    "rule_id": item.get("rule_id"),
+                                }
+                            )
+            elif res.agent_name == "style_agent":
+                for style_key in ("eslint", "pylint", "dead_code"):
+                    for item in (tr.get(style_key) or {}).get("findings", []) or []:
+                        sig = (str(item.get("file_path") or ""), int(item.get("line_number") or 0), str(item.get("rule_id") or ""))
+                        if sig not in existing_sig:
+                            existing_sig.add(sig)
+                            all_raw_findings.append(
+                                {
+                                    "agent": "Style Agent",
+                                    "category": "code_quality",
+                                    "severity": item.get("severity", "Low"),
+                                    "title": f"{item.get('rule_id', 'STYLE')}: {str(item.get('message', ''))[:80]}",
+                                    "description": item.get("message", ""),
+                                    "file_path": item.get("file_path", ""),
+                                    "line_number": item.get("line_number"),
+                                    "end_line": item.get("end_line"),
+                                    "evidence": item.get("message", ""),
+                                    "recommendation": "Resolve linter or dead-code violation.",
+                                    "verification_status": "Verified",
+                                    "tool_name": item.get("tool", style_key.replace("_", "-")),
+                                    "rule_id": item.get("rule_id"),
+                                }
+                            )
             if res.status in ("incomplete", "failed") and tr:
                 if res.agent_name == "security_agent":
                     for tool_key in ("bandit", "semgrep", "gitleaks", "osv_scanner"):
@@ -391,16 +470,19 @@ class ReviewerManagerExecutor(Executor):
                 f,
                 evidence_records,
                 state.workspace_dir,
+                execution_telemetry=extras.get("test_telemetry"),
             )
             if fabricated:
                 fabricated_claims += 1
             if guarded.get("tool_name") == "gitleaks" and is_test_fixture_hit(
                 state.workspace_dir, fp, ln, str(guarded.get("evidence") or "")
             ):
-                guarded["severity"] = "Low"
                 guarded["is_test_fixture"] = True
+            guarded["severity"] = normalize_severity_with_criteria(guarded)
 
             verified_raw.append(guarded)
+
+        contradictions = detect_cross_agent_contradictions(verified_raw, extras)
 
         test_suites = ((extras.get("test_import_map") or {}).get("test_suites") or {}).keys()
         manager_plan = (state.review_plan.get("agent_plans") or {}).get("reviewer_manager") or {}
@@ -458,22 +540,23 @@ class ReviewerManagerExecutor(Executor):
                     )
                     continue
 
-                # Force EvidenceGuard provenance verification regardless of what LLM claims
+                # Force EvidenceGuard provenance verification + permission check regardless of what LLM claims
                 guarded_item, fabricated = verify_finding_provenance(
                     item,
                     evidence_records,
                     state.workspace_dir,
+                    execution_telemetry=extras.get("test_telemetry"),
                 )
                 if fabricated:
                     fabricated_claims += 1
 
                 fp = str(guarded_item.get("file_path") or "").strip()
                 ln = guarded_item.get("line_number")
-                sev = str(guarded_item.get("severity") or "Medium").title()
                 if guarded_item.get("tool_name") == "gitleaks" and is_test_fixture_hit(
                     state.workspace_dir, fp, ln, str(guarded_item.get("evidence") or "")
                 ):
-                    sev = "Low"
+                    guarded_item["is_test_fixture"] = True
+                sev = normalize_severity_with_criteria(guarded_item)
 
                 consolidated.append(
                     {
@@ -546,6 +629,8 @@ class ReviewerManagerExecutor(Executor):
                 "rejected_false_positives": all_rejected[:20],
                 "evidence_store_count": len(evidence_records),
                 "fabricated_tool_claims_count": fabricated_claims,
+                "cross_agent_contradictions_count": len(contradictions),
+                "cross_agent_contradictions": contradictions[:15],
                 "stair_context_tokens": stair_ctx["token_estimate"],
                 "stair_fallback_used": stair_ctx["fallback_used"],
                 "recommendation": recommendation,

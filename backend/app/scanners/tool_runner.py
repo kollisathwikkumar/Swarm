@@ -96,10 +96,23 @@ async def get_tool_version(name: str, args: tuple[str, ...] = ("--version",)) ->
     return ver
 
 
+def resolve_workspace_binary(workspace_dir: Path, name: str) -> str | None:
+    """Resolve repo-local node_modules/.bin/<name> or .venv/bin/<name> before falling back globally."""
+    for rel in (Path("node_modules") / ".bin" / name, Path(".venv") / "bin" / name):
+        cand = (workspace_dir / rel).resolve()
+        if cand.exists() and os.access(cand, os.X_OK):
+            return str(cand)
+    return resolve_binary(name)
+
+
 async def check_installed_scanners() -> dict[str, dict[str, Any]]:
-    tools = ["git", "semgrep", "gitleaks", "bandit", "osv-scanner", "ruff", "pytest", "coverage", "node"]
+    core_tools = ["git", "semgrep", "gitleaks", "bandit", "osv-scanner", "ruff", "pytest", "coverage", "node"]
+    optional_tools = ["eslint", "pylint", "codeql", "trivy", "mypy", "tsc", "hypothesis", "mutmut"]
     status: dict[str, dict[str, Any]] = {}
-    for tool in tools:
+    for tool in core_tools:
         path = resolve_binary(tool)
-        status[tool] = {"available": path is not None, "path": path or ""}
+        status[tool] = {"available": path is not None, "path": path or "", "optional": False}
+    for tool in optional_tools:
+        path = resolve_binary(tool)
+        status[tool] = {"available": path is not None, "path": path or "", "optional": True}
     return status

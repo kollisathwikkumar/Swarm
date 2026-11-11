@@ -4,6 +4,7 @@ import re
 from typing import Any
 
 from app.intelligence.context_builder import AGENT_TOKEN_BUDGETS
+from app.skills.permissions import AGENT_CAPABILITY_REGISTRY
 
 _DOC_EXTENSIONS = (".md", ".mdx", ".txt", ".rst", ".svg", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".license")
 _PYTHON_EXTENSIONS = (".py", ".pyi")
@@ -105,17 +106,44 @@ def build_review_plan(
     if touches_deps or any(p.endswith((".yml", ".yaml", ".json", ".toml", ".env")) for p in changed_paths):
         diff_skills.append("config_and_dependency_impact")
 
-    style_skills = ["deterministic_linting", "complexity_and_smells", "local_safe_refactoring"]
-    security_skills = ["deterministic_sast_and_secrets", "injection_and_ssrf_trace", "authz_boundary_audit"]
+    style_skills = [
+        "language_specific_linting",
+        "code_smell_detection",
+        "dead_code_detection",
+        "naming_and_convention_analysis",
+        "maintainability_analysis",
+        "safe_refactoring_suggestions",
+        "existing_pattern_detection",
+    ]
+    security_skills = [
+        "taint_analysis",
+        "data_flow_analysis",
+        "auth_and_authz_analysis",
+        "injection_analysis",
+        "secrets_detection",
+        "cryptography_analysis",
+        "threat_modelling",
+        "exploitability_reasoning",
+    ]
     if touches_deps:
-        security_skills.append("dependency_cve_audit")
-    test_skills = ["test_execution_analysis", "changed_symbol_coverage_gap", "edge_case_assertion_audit"]
+        security_skills.append("dependency_vulnerability_analysis")
+    test_skills = [
+        "test_discovery",
+        "test_to_code_mapping",
+        "coverage_gap_analysis",
+        "regression_test_generation",
+        "property_based_testing",
+        "mutation_testing",
+        "failure_triage",
+        "minimal_reproduction",
+    ]
 
     agent_plans: dict[str, dict[str, Any]] = {
         "diff_agent": {
             "mode": "deep" if high_risk else ("light" if docs_only else "standard"),
             "token_budget": AGENT_TOKEN_BUDGETS["diff_agent"],
             "focus_skills": diff_skills,
+            "permissions": AGENT_CAPABILITY_REGISTRY["diff_agent"].to_dict(),
             "skip_scanners": False,
             "focus_files": changed_paths[:10],
         },
@@ -123,8 +151,11 @@ def build_review_plan(
             "mode": "light" if skip_heavy_scanners else "standard",
             "token_budget": AGENT_TOKEN_BUDGETS["style_agent"],
             "focus_skills": style_skills,
+            "permissions": AGENT_CAPABILITY_REGISTRY["style_agent"].to_dict(),
             "skip_scanners": skip_heavy_scanners,
             "run_ruff": has_python and not skip_heavy_scanners,
+            "run_eslint": has_js_ts and not skip_heavy_scanners,
+            "run_pylint": has_python and not skip_heavy_scanners,
             "run_js_ast": has_js_ts and not skip_heavy_scanners,
             "focus_files": [p for p in changed_paths if not _is_doc_or_asset(p)][:10],
         },
@@ -132,30 +163,38 @@ def build_review_plan(
             "mode": "deep" if high_risk else ("light" if skip_heavy_scanners else "standard"),
             "token_budget": int(AGENT_TOKEN_BUDGETS["security_agent"] * (1.3 if high_risk else 1.0)),
             "focus_skills": security_skills,
+            "permissions": AGENT_CAPABILITY_REGISTRY["security_agent"].to_dict(),
             "skip_scanners": skip_heavy_scanners,
             "run_bandit": has_python and not skip_heavy_scanners,
             "run_semgrep": not skip_heavy_scanners,
             "run_gitleaks": not skip_heavy_scanners,
             "run_osv": touches_deps or (not skip_heavy_scanners and len(changed_paths) > 0),
+            "run_taint": not skip_heavy_scanners,
+            "run_codeql": high_risk and not skip_heavy_scanners,
+            "run_trivy": (high_risk or touches_deps) and not skip_heavy_scanners,
             "focus_files": changed_paths[:10],
         },
         "test_coverage_agent": {
             "mode": "light" if skip_heavy_scanners else ("deep" if high_risk else "standard"),
             "token_budget": AGENT_TOKEN_BUDGETS["test_coverage_agent"],
             "focus_skills": test_skills,
+            "permissions": AGENT_CAPABILITY_REGISTRY["test_coverage_agent"].to_dict(),
             "skip_scanners": skip_heavy_scanners,
+            "selective_test_mode": not high_risk and not touches_deps,
             "require_tests_pass": bool((policy or {}).get("require_tests_pass", True)),
             "focus_files": changed_paths[:10],
         },
         "reviewer_manager": {
             "mode": "deep" if high_risk else "standard",
             "token_budget": int(AGENT_TOKEN_BUDGETS["reviewer_manager"] * (1.3 if high_risk else 1.0)),
-            "focus_skills": ["independent_evidence_verification", "guard_refutation_check", "semantic_deduplication"],
+            "focus_skills": list(AGENT_CAPABILITY_REGISTRY["reviewer_manager"].skills),
+            "permissions": AGENT_CAPABILITY_REGISTRY["reviewer_manager"].to_dict(),
         },
         "fix_suggestion_agent": {
             "mode": "standard",
             "token_budget": AGENT_TOKEN_BUDGETS["fix_suggestion_agent"],
-            "focus_skills": ["verified_only_patching", "syntax_and_guard_revalidation", "minimal_blast_radius"],
+            "focus_skills": list(AGENT_CAPABILITY_REGISTRY["fix_suggestion_agent"].skills),
+            "permissions": AGENT_CAPABILITY_REGISTRY["fix_suggestion_agent"].to_dict(),
         },
     }
 

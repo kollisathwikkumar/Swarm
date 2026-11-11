@@ -89,13 +89,21 @@ class DiffAgentExecutor(Executor):
                 target_commit=state.target_commit,
                 diff_text=state.diff_text,
                 changed_files=state.changed_files,
+                structure_index=state.structure_index,
             )
+            ast_diff = diff_ctx.get("ast_diff") or {}
+            semantic_counts = ast_diff.get("semantic_counts") or {}
             await self._emit(
                 state.review_id,
                 "agent_progress",
                 {
                     "agent_name": "diff_agent",
-                    "message": f"Parsed {diff_ctx['total_files']} changed file(s) (+{diff_ctx['total_additions']} / -{diff_ctx['total_deletions']})",
+                    "message": (
+                        f"Parsed {diff_ctx['total_files']} changed file(s) "
+                        f"(+{diff_ctx['total_additions']}/-{diff_ctx['total_deletions']}, "
+                        f"{len(ast_diff.get('ast_symbol_changes') or [])} symbol diff(s), "
+                        f"{len(ast_diff.get('api_contract_changes') or [])} API contract change(s))"
+                    ),
                 },
             )
 
@@ -114,17 +122,33 @@ class DiffAgentExecutor(Executor):
                 "total_additions": diff_ctx.get("total_additions"),
                 "total_deletions": diff_ctx.get("total_deletions"),
                 "files": compact_files[:40],
+                "ast_diff": {
+                    "semantic_counts": semantic_counts,
+                    "ast_symbol_changes": (ast_diff.get("ast_symbol_changes") or [])[:25],
+                    "api_contract_changes": ast_diff.get("api_contract_changes") or [],
+                    "config_and_dependency_impacts": ast_diff.get("config_and_dependency_impacts") or [],
+                    "downstream_impact": ast_diff.get("downstream_impact") or {},
+                },
                 "polyglot_symbols": diff_ctx.get("polyglot_symbols", {}),
             }
             agent_plan = (state.review_plan.get("agent_plans") or {}).get("diff_agent") or {}
+            # Token-saving rule: retrieve surrounding caller/callee context only when symbols have logic/contract edits or consumers
+            needs_surrounding = bool(
+                semantic_counts.get("algorithm_or_logic_edits", 0)
+                or semantic_counts.get("signature_or_contract_changes", 0)
+                or semantic_counts.get("permission_or_guard_edits", 0)
+                or state.review_plan.get("risk_tier") == "high"
+            )
+            eff_budget = agent_plan.get("token_budget", 3000) if needs_surrounding else min(1200, agent_plan.get("token_budget", 1200))
             stair_ctx = build_agent_context(
                 role="diff_agent",
                 workspace_dir=state.workspace_dir,
                 structure_index=state.structure_index,
                 changed_files=state.changed_files,
                 diff_text=state.diff_text,
+                evidence_items=ast_diff.get("findings") or [],
                 target_files=agent_plan.get("focus_files"),
-                token_budget=agent_plan.get("token_budget"),
+                token_budget=eff_budget,
                 expand_for_high_risk=state.review_plan.get("risk_tier") == "high",
             )
             truncated_diff = (state.diff_text or "")[:10000]

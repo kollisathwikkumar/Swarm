@@ -1124,7 +1124,7 @@ async def test_p0_evidence_guard_blocks_fabrication_and_gates_patches(tmp_path: 
         tmp_path, "src/clean.ts", unsafe_proposed, diff_bad
     )
     assert combined_ok is False
-    assert "security guard" in val_msg.lower()
+    assert "security/taint" in val_msg.lower()
 
 
 def test_p1_stair_hierarchical_retrieval_finds_deep_symbol_and_caller(tmp_path: Path):
@@ -1329,6 +1329,336 @@ async def test_p3_central_review_planner_and_workflow_dispatch(tmp_path: Path):
     assert out.review_plan["risk_tier"] == "low"
     assert "writes" in out.cache_stats
     assert any(ev == "fan_out_started" for _, ev, _ in events)
+
+
+@pytest.mark.asyncio
+async def test_p4_permissions_and_cross_agent_contradictions(tmp_path: Path):
+    from app.skills.permissions import AGENT_CAPABILITY_REGISTRY
+    from app.verification.evidence_guard import (
+        EvidenceRecord,
+        detect_cross_agent_contradictions,
+        normalize_severity_with_criteria,
+        verify_finding_provenance,
+    )
+
+    assert AGENT_CAPABILITY_REGISTRY["fix_suggestion_agent"].can_propose_patches is True
+    for k, cap in AGENT_CAPABILITY_REGISTRY.items():
+        assert cap.can_commit_directly is False
+        assert cap.can_self_certify_verified is False
+        if k != "fix_suggestion_agent":
+            assert cap.can_propose_patches is False
+
+    (tmp_path / "mod.py").write_text("def x():\n    return 1\n", encoding="utf-8")
+    recs = [
+        EvidenceRecord(
+            evidence_id="EV-001",
+            tool_name="pytest",
+            rule_id="TEST-PASS",
+            file_path="mod.py",
+            line_number=1,
+            end_line=2,
+            commit_sha="HEAD",
+            source_hash="abcd",
+            snippet="ok",
+            severity="Low",
+        )
+    ]
+
+    # Diff Agent cannot verify test execution even if claiming tool/pass
+    fake_test_claim = {
+        "agent": "Diff Agent",
+        "title": "Tests passed cleanly",
+        "description": "I ran tests and verified all unit tests executed cleanly.",
+        "file_path": "mod.py",
+        "line_number": 1,
+        "tool_name": "pytest",
+        "verification_status": "Verified",
+    }
+    sanitized, flagged = verify_finding_provenance(
+        fake_test_claim, recs, tmp_path, execution_telemetry={"runner": "pytest", "status": "completed"}
+    )
+    assert flagged is True
+    assert sanitized["verification_status"] == "Needs Verification"
+    assert sanitized["evidence_ids"] == []
+    assert sanitized.get("permission_violations")
+
+    # Test-Coverage Agent cannot verify runtime tests if runner was static_js_ts_inspection
+    ts_fake_run = {
+        "agent": "Test-Coverage Agent",
+        "title": "Verified by test execution",
+        "description": "Ran the tests and passed.",
+        "file_path": "mod.py",
+        "line_number": 1,
+        "tool_name": "vitest",
+        "verification_status": "Verified",
+    }
+    ts_san, ts_flag = verify_finding_provenance(
+        ts_fake_run, recs, tmp_path, execution_telemetry={"runner": "static_js_ts_inspection", "status": "completed"}
+    )
+    assert ts_flag is True
+    assert ts_san["verification_status"] == "Needs Verification"
+
+    # Cross-agent contradiction & severity normalization
+    contradictions = detect_cross_agent_contradictions(
+        [
+            {"agent": "Diff Agent", "file_path": "mod.py", "title": "Safe refactor"},
+            {"agent": "Test-Coverage Agent", "file_path": "mod.py", "title": "Untested module - no tests found"},
+        ],
+        {"test_import_map": {"source_file_test_map": {"mod.py": {"has_any_unmocked_test": True, "coverage_status": "direct_tests_present"}}}},
+    )
+    assert len(contradictions) == 1
+    assert normalize_severity_with_criteria({"rule_id": "TAINT-SQL-INJECTION", "severity": "Low"}) == "Critical"
+
+
+@pytest.mark.asyncio
+async def test_p4_diff_ast_semantic_api_contract_and_config_impact(tmp_path: Path):
+    from app.intelligence.structure_indexer import build_structure_index
+    from app.scanners.diff_engines import analyze_ast_and_contract_diff
+
+    await _arun_git("init", cwd=tmp_path)
+    await _arun_git("config", "user.email", "dev@example.com", cwd=tmp_path)
+    await _arun_git("config", "user.name", "Dev", cwd=tmp_path)
+
+    pkg = tmp_path / "src"
+    pkg.mkdir()
+    (pkg / "pure.py").write_text("def double_val(val: int) -> int:\n    res = val * 2\n    return res\n", encoding="utf-8")
+    (pkg / "api.py").write_text("def compute_fee(amount: float) -> float:\n    return amount * 1.1\n", encoding="utf-8")
+    (pkg / "caller.py").write_text("from src.api import compute_fee\ndef bill():\n    return compute_fee(10.0)\n", encoding="utf-8")
+    await _arun_git("add", ".", cwd=tmp_path)
+    await _arun_git("commit", "-m", "base", cwd=tmp_path)
+
+    # Target edits: variable rename only in pure.py; API signature + env config change in api.py
+    (pkg / "pure.py").write_text("def double_val(val: int) -> int:\n    out = val * 2\n    return out\n", encoding="utf-8")
+    (pkg / "api.py").write_text(
+        "import os\ndef compute_fee(amount: float, currency: str) -> float:\n"
+        "    rate = float(os.getenv('FEE_RATE', '1.1'))\n    return amount * rate\n",
+        encoding="utf-8",
+    )
+
+    changed = [
+        {"path": "src/pure.py", "status": "modified", "changed_lines": [2, 3]},
+        {"path": "src/api.py", "status": "modified", "changed_lines": [2, 3, 4]},
+    ]
+    index = build_structure_index(tmp_path, changed)
+    ast_diff = await analyze_ast_and_contract_diff(
+        tmp_path,
+        base_commit="HEAD",
+        target_commit="WORKING_TREE",
+        changed_files=changed,
+        structure_index=index,
+    )
+    assert ast_diff["semantic_counts"]["cosmetic_or_variable_renames"] >= 1
+    assert ast_diff["semantic_counts"]["signature_or_contract_changes"] >= 1
+    assert any(c["symbol"] == "compute_fee" for c in ast_diff["api_contract_changes"])
+    assert any("os.getenv" in c["config_signals"] for c in ast_diff["config_and_dependency_impacts"])
+    assert ast_diff["downstream_impact"]["src/api.py"]["blast_radius_count"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_p4_style_dead_code_complexity_naming_and_token_saver(tmp_path: Path, monkeypatch):
+    from app.agents.style_agent import StyleAgentExecutor
+    from app.config import AGENT_METADATA
+    from app.intelligence.structure_indexer import build_structure_index
+    from app.orchestration.shared_state import AgentExecutionConfig
+    from app.scanners.style_tools import run_style_scanners
+
+    # Establish snake_case repo convention
+    for idx in range(5):
+        (tmp_path / f"util_{idx}.py").write_text(
+            f"def snake_helper_{idx}(x: int) -> int:\n    return x + {idx}\n",
+            encoding="utf-8",
+        )
+
+    many_imports = "\n".join(f"import mod_{i}" for i in range(16)) + "\n"
+    long_body = "\n".join("    x += 1" for _ in range(62))
+    (tmp_path / "legacy.py").write_text(
+        many_imports
+        + "def _unused_private():\n    return 1\n\n"
+        + "def badCamelName(flag_a: bool, flag_b: bool, flag_c: bool, flag_d: bool) -> int:\n"
+        + "    if flag_a:\n        if flag_b:\n            if flag_c:\n                if flag_d:\n                    return 42\n"
+        + "    return 0\n    unreachable = 99\n\n"
+        + f"def overly_long_fn(x: int) -> int:\n{long_body}\n    return x\n",
+        encoding="utf-8",
+    )
+
+    changed = [{"path": "legacy.py", "status": "modified", "changed_lines": [18, 25]}]
+    s_index = build_structure_index(tmp_path, changed)
+    s_res = await run_style_scanners(tmp_path, ["legacy.py"], structure_index=s_index)
+    ast_rules = {f["rule_id"] for f in s_res["ast_checks"]["findings"]}
+    dead_rules = {f["rule_id"] for f in s_res["dead_code"]["findings"]}
+    assert {"STYLE-HIGH-COUPLING", "STYLE-DEEP-NESTING", "STYLE-LONG-FUNCTION", "STYLE-NAMING-CONVENTION"} <= ast_rules
+    assert {"DEAD-UNREACHABLE-CODE", "DEAD-UNUSED-PRIVATE-SYMBOL"} <= dead_rules
+
+    # Verify Style Agent token-saver skips LLM when clean + API key present
+    clean_ws = tmp_path / "clean_ws"
+    clean_ws.mkdir()
+    (clean_ws / "clean.py").write_text("def add_one(x: int) -> int:\n    return x + 1\n", encoding="utf-8")
+
+    llm_calls = 0
+
+    async def _fail_if_called(*_args, **_kwargs):
+        nonlocal llm_calls
+        llm_calls += 1
+        return {"summary": "llm", "findings": []}
+
+    monkeypatch.setattr("app.agents.style_agent.run_structured_agent", _fail_if_called)
+    captured: list[AgentExecutionOutput] = []
+
+    class _Sink(Executor):
+        def __init__(self) -> None:
+            super().__init__(id="sink")
+
+        @handler
+        async def take(self, msg: AgentExecutionOutput, ctx: WorkflowContext[AgentExecutionOutput]) -> None:
+            captured.append(msg)
+
+    async def _noop_emit(_rid: str, _ev: str, _pl: dict[str, object]) -> None:
+        return None
+
+    style_exec = StyleAgentExecutor(_noop_emit)
+    sink = _Sink()
+    wf = WorkflowBuilder(start_executor=style_exec).add_edge(style_exec, sink).build()
+    configs = {
+        k: AgentExecutionConfig(
+            agent_name=k,
+            label=m["label"],
+            model=m["default_model"],
+            base_url="https://api.deepseek.com",
+            api_key="sk-test-key",
+        )
+        for k, m in AGENT_METADATA.items()
+    }
+    st = ReviewState(
+        review_id="rev-style-saver",
+        repository_id="r",
+        repository_name="clean/repo",
+        source_type="local",
+        base_commit="HEAD~1",
+        target_commit="HEAD",
+        workspace_dir=clean_ws,
+        diff_text="+def add_one(x: int) -> int: ...",
+        changed_files=[{"path": "clean.py", "changed_lines": [1, 2]}],
+        policy={},
+        agent_configs=configs,
+        cache_dir=clean_ws / "_cache",
+    )
+    await wf.run(st)
+    assert llm_calls == 0
+    assert captured and captured[0].status == "completed"
+    assert captured[0].raw_output.get("llm_skipped_token_saver") is True
+
+
+@pytest.mark.asyncio
+async def test_p4_security_taint_authz_crypto_and_optional_scanners(tmp_path: Path):
+    from app.intelligence.structure_indexer import build_structure_index
+    from app.scanners.security_tools import run_security_scanners
+
+    (tmp_path / "routes.py").write_text(
+        "import hashlib\n"
+        "import random\n"
+        "import subprocess\n\n"
+        "@router.post('/admin/run')\n"
+        "def run_admin_action(cmd: str, fname: str, uid: str, conn):\n"
+        "    tok = ''.join(random.choice('abcdef') for _ in range(8))\n"
+        "    sig = hashlib.md5(tok.encode()).hexdigest()\n"
+        "    conn.execute(f'SELECT * FROM users WHERE id = {uid}')\n"
+        "    data = open(fname).read()\n"
+        "    return subprocess.run(cmd, shell=True), sig, data\n",
+        encoding="utf-8",
+    )
+    s_idx = build_structure_index(tmp_path, [{"path": "routes.py", "changed_lines": [5, 9, 11]}])
+    sec = await run_security_scanners(
+        tmp_path,
+        ["routes.py"],
+        plan={"run_bandit": False, "run_semgrep": False, "run_gitleaks": False, "run_osv": False, "run_taint": True, "run_codeql": True, "run_trivy": True},
+        structure_index=s_idx,
+    )
+    taint_rules = {f["rule_id"] for f in sec["taint_analysis"]["findings"]}
+    assert {
+        "AUTHZ-MISSING-ROUTE-GUARD",
+        "CRYPTO-INSECURE-RANDOM",
+        "CRYPTO-WEAK-HASH",
+        "TAINT-SQL-INJECTION",
+        "TAINT-PATH-TRAVERSAL",
+        "TAINT-CMD-INJECTION",
+    } <= taint_rules
+    assert "api_endpoints" in sec["taint_analysis"]["threat_surfaces"]
+    assert sec["codeql"]["status"] in ("optional_unavailable", "completed")
+    assert sec["trivy"]["status"] in ("optional_unavailable", "completed")
+
+
+@pytest.mark.asyncio
+async def test_p4_test_impact_selection_triage_property_and_patch_sandbox(tmp_path: Path):
+    from app.agents.fix_suggestion_agent import _validate_patch_bundle
+    from app.intelligence.structure_indexer import build_structure_index
+    from app.scanners.test_tools import run_test_and_coverage, triage_test_failure
+
+    await _arun_git("init", cwd=tmp_path)
+    await _arun_git("config", "user.email", "dev@example.com", cwd=tmp_path)
+    await _arun_git("config", "user.name", "Dev", cwd=tmp_path)
+
+    (tmp_path / "calc.py").write_text("def add_nums(a: int, b: int) -> int:\n    return a - b\n", encoding="utf-8")
+    (tmp_path / "test_calc.py").write_text(
+        "from calc import add_nums\ndef test_add_ok():\n    assert add_nums(5, 2) == 3\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "test_unrelated_fail.py").write_text(
+        "def test_always_fails():\n    assert False\n",
+        encoding="utf-8",
+    )
+    await _arun_git("add", ".", cwd=tmp_path)
+    await _arun_git("commit", "-m", "init", cwd=tmp_path)
+
+    # Impact-graph subset runs ONLY test_calc.py (skipping unrelated failing test!)
+    idx = build_structure_index(tmp_path, [{"path": "calc.py", "changed_lines": [2]}])
+    tres = await run_test_and_coverage(
+        tmp_path,
+        ["calc.py"],
+        plan={"selective_test_mode": True},
+        structure_index=idx,
+    )
+    assert tres["selection_mode"] == "impact_graph_subset"
+    assert tres["selected_test_files"] == ["test_calc.py"]
+    assert tres["passed"] == 1
+    assert tres["failed"] == 0
+    assert any(
+        c["symbol"] == "add_nums" for c in tres["property_and_mutation"]["property_testing"]["candidates"]
+    )
+    assert tres["property_and_mutation"]["property_testing"]["executed"] is False
+
+    # Failure triage categories
+    assert triage_test_failure("ModuleNotFoundError: No module named 'foo'", 1)["category"] == "dependency_or_env_failure"
+    assert triage_test_failure("FAILED test_x - AssertionError: 1 != 2", 1)["category"] == "code_assertion_failure"
+
+    # Isolated patch validation: clean fix + valid regression test passes without touching workspace
+    fixed_calc = "def add_nums(a: int, b: int) -> int:\n    return a + b\n"
+    diff_fix = _compute_unified_diff("calc.py", (tmp_path / "calc.py").read_text(encoding="utf-8"), fixed_calc)
+    reg_test_fail = "from calc import add_nums\ndef test_add_wrong():\n    assert add_nums(2, 3) == 999\n"
+    bad_ok, _, _, bad_msg = await _validate_patch_bundle(
+        tmp_path,
+        "calc.py",
+        fixed_calc,
+        diff_fix,
+        related_tests=[],
+        regression_test_code=reg_test_fail,
+    )
+    assert bad_ok is False
+    assert "targeted tests failed" in bad_msg.lower()
+
+    reg_test_pass = "from calc import add_nums\ndef test_add_fixed():\n    assert add_nums(2, 3) == 5\n"
+    good_ok, _, _, good_msg = await _validate_patch_bundle(
+        tmp_path,
+        "calc.py",
+        fixed_calc,
+        diff_fix,
+        related_tests=[],
+        regression_test_code=reg_test_pass,
+    )
+    assert good_ok is True
+    assert "targeted tests passed" in good_msg.lower()
+    # Original workspace remains completely clean (rollback safe!)
+    assert "return a - b" in (tmp_path / "calc.py").read_text(encoding="utf-8")
+
 
 
 

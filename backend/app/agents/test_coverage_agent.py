@@ -87,6 +87,7 @@ class TestCoverageAgentExecutor(Executor):
                 changed_paths,
                 enable_execution=enable_exec,
                 plan=agent_plan,
+                structure_index=state.structure_index,
             )
             runner_label = str(test_res.get("runner") or "pytest").upper()
             await self._emit(
@@ -95,7 +96,8 @@ class TestCoverageAgentExecutor(Executor):
                 {
                     "agent_name": "test_coverage_agent",
                     "message": (
-                        f"{runner_label}: {test_res.get('tests_found', 0)} test file(s) mapped, "
+                        f"{runner_label} ({test_res.get('selection_mode', 'full')}): "
+                        f"{test_res.get('tests_found', 0)} test file(s) mapped, "
                         f"{test_res.get('passed', 0)} passed, "
                         f"{test_res.get('failed', 0)} failed"
                         + (
@@ -107,33 +109,44 @@ class TestCoverageAgentExecutor(Executor):
                 },
             )
 
-            test_first_paths = [p for p in changed_paths if is_test_file_path(p)] + [
-                p for p in changed_paths if not is_test_file_path(p)
-            ]
-            suite_paths = list((test_res.get("test_import_map") or {}).get("test_suites", {}).keys())
-            stair_ctx = build_agent_context(
-                role="test_coverage_agent",
-                workspace_dir=state.workspace_dir,
-                structure_index=state.structure_index,
-                changed_files=state.changed_files,
-                diff_text=state.diff_text,
-                target_files=list(dict.fromkeys(test_first_paths + suite_paths)),
-                token_budget=agent_plan.get("token_budget"),
-                expand_for_high_risk=state.review_plan.get("risk_tier") == "high",
-            )
-            contract_block = format_agent_contract("test_coverage_agent", agent_plan)
+            # Token-saving rule: on skipped/docs-only diffs or completely clean non-high-risk suites where all changed code is covered, skip redundant LLM calls
+            if agent_plan.get("skip_scanners") and cfg.api_key.strip():
+                llm_out: dict[str, Any] = {
+                    "summary": "Skipped test suite execution for low-risk documentation/asset change (token saver).",
+                    "findings": [],
+                    "llm_skipped_token_saver": True,
+                }
+            else:
+                # Token-saving rule: prioritize ONLY impacted tests rather than every test file in the repository
+                impacted_tests = list(test_res.get("selected_test_files") or [])
+                test_first_paths = [p for p in changed_paths if is_test_file_path(p)] + [
+                    p for p in changed_paths if not is_test_file_path(p)
+                ]
+                stair_ctx = build_agent_context(
+                    role="test_coverage_agent",
+                    workspace_dir=state.workspace_dir,
+                    structure_index=state.structure_index,
+                    changed_files=state.changed_files,
+                    diff_text=state.diff_text,
+                    target_files=list(dict.fromkeys(test_first_paths + impacted_tests[:6])),
+                    token_budget=agent_plan.get("token_budget"),
+                    expand_for_high_risk=state.review_plan.get("risk_tier") == "high",
+                )
+                contract_block = format_agent_contract("test_coverage_agent", agent_plan)
 
-            user_prompt = (
-                f"Repository: {state.repository_name}\n"
-                f"Changed files: {json.dumps(changed_paths[:40])}\n\n"
-                f"{contract_block}\n\n"
-                f"Test Runner & Cross-File Test-Import Coverage Map:\n{json.dumps(test_res, indent=2)[:15000]}\n\n"
-                f"{stair_ctx['context_text']}\n\n"
-                f"Unified Diff Excerpt:\n```diff\n{(state.diff_text or '')[:6000]}\n```"
-            )
-            llm_out = await run_structured_agent(
-                cfg, system_prompt=SYSTEM_PROMPT, user_prompt=user_prompt, timeout_seconds=70.0
-            )
+                user_prompt = (
+                    f"Repository: {state.repository_name}\n"
+                    f"Changed files: {json.dumps(changed_paths[:40])}\n\n"
+                    f"{contract_block}\n\n"
+                    "REPRODUCTION & TOKEN RULE: Use only the selected impacted tests and property/mutation candidates below. "
+                    "Never claim tests or mutations executed if telemetry shows `executed: false` or `static_js_ts_inspection`.\n\n"
+                    f"Test Runner, Failure Triage, Impact Map & Property Candidates:\n{json.dumps(test_res, indent=2)[:15000]}\n\n"
+                    f"{stair_ctx['context_text']}\n\n"
+                    f"Unified Diff Excerpt:\n```diff\n{(state.diff_text or '')[:6000]}\n```"
+                )
+                llm_out = await run_structured_agent(
+                    cfg, system_prompt=SYSTEM_PROMPT, user_prompt=user_prompt, timeout_seconds=70.0
+                )
 
             findings: list[StructuredFinding] = []
             for item in llm_out.get("findings", []) or []:

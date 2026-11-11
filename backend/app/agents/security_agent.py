@@ -90,12 +90,13 @@ class SecurityAgentExecutor(Executor):
                 commit_context=commit_ctx,
                 config_hash=hash_config_dict({"policy": state.policy, "security_plan": agent_plan}),
                 plan=agent_plan,
+                structure_index=state.structure_index,
             )
             sec_res["cache_stats"] = cache.stats.to_dict()
             scanner_evidence: list[dict[str, Any]] = []
             total_raw = 0
             for v in sec_res.values():
-                if isinstance(v, dict):
+                if isinstance(v, dict) and "findings" in v:
                     f_list = v.get("findings", [])
                     total_raw += len(f_list)
                     scanner_evidence.extend(f_list)
@@ -110,37 +111,58 @@ class SecurityAgentExecutor(Executor):
                         f"Semgrep: {len(sec_res['semgrep']['findings'])}, "
                         f"Gitleaks: {len(sec_res['gitleaks']['findings'])}, "
                         f"OSV: {len(sec_res['osv_scanner']['findings'])}, "
+                        f"Taint: {len(sec_res['taint_analysis']['findings'])}, "
                         f"Guards: {len(sec_res['deterministic_guards']['findings'])}"
                         + (", cache hit)" if sec_res.get("cache_hit") else ")")
                     ),
                 },
             )
 
-            stair_ctx = build_agent_context(
-                role="security_agent",
-                workspace_dir=state.workspace_dir,
-                structure_index=state.structure_index,
-                changed_files=state.changed_files,
-                diff_text=state.diff_text,
-                evidence_items=scanner_evidence,
-                target_files=agent_plan.get("focus_files"),
-                token_budget=agent_plan.get("token_budget"),
-                expand_for_high_risk=state.review_plan.get("risk_tier") == "high",
+            threat_surfaces = (sec_res.get("taint_analysis") or {}).get("threat_surfaces") or []
+            # Token-saving rule: if docs-only/skipped or configured key with zero raw hits and zero security threat surfaces, skip redundant deep LLM scan
+            skip_llm_clean = bool(
+                (agent_plan.get("skip_scanners") and cfg.api_key.strip())
+                or (
+                    cfg.api_key.strip()
+                    and total_raw == 0
+                    and not threat_surfaces
+                    and state.review_plan.get("risk_tier") == "low"
+                )
             )
-            contract_block = format_agent_contract("security_agent", agent_plan)
+            if skip_llm_clean:
+                llm_out: dict[str, Any] = {
+                    "summary": "Fast security scanners, taint analysis, and threat-surface checks completed cleanly with zero findings; deep LLM analysis skipped (low-risk token saver).",
+                    "findings": [],
+                    "llm_skipped_token_saver": True,
+                }
+            else:
+                stair_ctx = build_agent_context(
+                    role="security_agent",
+                    workspace_dir=state.workspace_dir,
+                    structure_index=state.structure_index,
+                    changed_files=state.changed_files,
+                    diff_text=state.diff_text,
+                    evidence_items=scanner_evidence,
+                    target_files=agent_plan.get("focus_files"),
+                    token_budget=agent_plan.get("token_budget"),
+                    expand_for_high_risk=state.review_plan.get("risk_tier") == "high",
+                )
+                contract_block = format_agent_contract("security_agent", agent_plan)
 
-            user_prompt = (
-                f"Repository: {state.repository_name}\n"
-                f"Plan Risk Tier: {state.review_plan.get('risk_tier', 'medium')}\n\n"
-                f"{contract_block}\n\n"
-                f"Deterministic Scanner Results (total raw hits={total_raw}):\n"
-                f"{json.dumps(sec_res, indent=2)[:12000]}\n\n"
-                f"{stair_ctx['context_text']}\n\n"
-                f"Unified Diff Excerpt:\n```diff\n{(state.diff_text or '')[:8000]}\n```"
-            )
-            llm_out = await run_structured_agent(
-                cfg, system_prompt=SYSTEM_PROMPT, user_prompt=user_prompt, timeout_seconds=75.0
-            )
+                user_prompt = (
+                    f"Repository: {state.repository_name}\n"
+                    f"Plan Risk Tier: {state.review_plan.get('risk_tier', 'medium')} | Threat Surfaces: {threat_surfaces}\n\n"
+                    f"{contract_block}\n\n"
+                    "TOKEN-SAVING & EXPLOITABILITY INSTRUCTION: Fast deterministic scanners & taint checks already ran. "
+                    "Do NOT rediscover scanner-matched bugs as new LLM guesses; assess reachability, exploitability, and cross-boundary logic only.\n\n"
+                    f"Deterministic Scanner & Taint Results (total raw hits={total_raw}):\n"
+                    f"{json.dumps(sec_res, indent=2)[:12000]}\n\n"
+                    f"{stair_ctx['context_text']}\n\n"
+                    f"Unified Diff Excerpt:\n```diff\n{(state.diff_text or '')[:8000]}\n```"
+                )
+                llm_out = await run_structured_agent(
+                    cfg, system_prompt=SYSTEM_PROMPT, user_prompt=user_prompt, timeout_seconds=75.0
+                )
 
             findings: list[StructuredFinding] = []
             for item in llm_out.get("findings", []) or []:

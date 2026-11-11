@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from app.scanners.code_engines import extract_polyglot_file_facts
+from app.scanners.diff_engines import analyze_ast_and_contract_diff
 from app.scanners.tool_runner import run_command_capture
 
 
@@ -123,6 +124,7 @@ async def collect_diff_context(
     target_commit: str,
     diff_text: str,
     changed_files: list[dict[str, Any]],
+    structure_index: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     parsed = parse_unified_diff(diff_text)
     if not parsed and changed_files:
@@ -166,6 +168,14 @@ async def collect_diff_context(
 
     active_paths = [f.path for f in parsed if f.status != "deleted"]
     polyglot_symbols = extract_polyglot_file_facts(workspace_dir, active_paths, limit=40)
+    ast_diff = await analyze_ast_and_contract_diff(
+        workspace_dir,
+        base_commit=base_commit,
+        target_commit=target_commit,
+        changed_files=[f.to_dict() for f in parsed],
+        structure_index=structure_index,
+        diff_text=diff_text,
+    )
 
     return {
         "base_commit": base_commit,
@@ -177,4 +187,5 @@ async def collect_diff_context(
         "files": [f.to_dict() for f in parsed],
         "python_ast_symbols": ast_symbols,
         "polyglot_symbols": polyglot_symbols,
+        "ast_diff": ast_diff,
     }

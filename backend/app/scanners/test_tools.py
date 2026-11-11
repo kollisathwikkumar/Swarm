@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import importlib.util
 import json
 import re
 from pathlib import Path
@@ -11,6 +13,7 @@ from app.scanners.tool_runner import (
     run_command_capture,
     sanitized_subprocess_env,
 )
+from app.services.git_workspace import resolve_within_dir
 
 
 def _resolve_ts_import(test_rel: str, spec: str, repo_files: set[str]) -> str | None:
@@ -200,12 +203,154 @@ def discover_test_files(workspace_dir: Path) -> dict[str, list[str]]:
     return {"python": sorted(py_tests), "js_ts": sorted(js_tests)}
 
 
+def select_impacted_tests(
+    changed_file_paths: list[str],
+    py_tests: list[str],
+    js_tests: list[str],
+    coverage_map: dict[str, Any],
+    structure_index: dict[str, Any] | None = None,
+) -> tuple[list[str], list[str], str]:
+    """Select only impacted test suites from the change-impact graph before falling back to full suite."""
+    shared_infra_changed = any(
+        Path(p).name in {"conftest.py", "pyproject.toml", "setup.cfg", "vitest.config.ts", "jest.config.js"}
+        for p in changed_file_paths
+    )
+    if shared_infra_changed or not changed_file_paths:
+        return py_tests, js_tests, "full_suite"
+
+    py_set = set(py_tests)
+    js_set = set(js_tests)
+    impacted_py: list[str] = []
+    impacted_js: list[str] = []
+
+    for ch in changed_file_paths:
+        if ch in py_set and ch not in impacted_py:
+            impacted_py.append(ch)
+        if ch in js_set and ch not in impacted_js:
+            impacted_js.append(ch)
+
+    src_map = (coverage_map or {}).get("source_file_test_map") or {}
+    test_links = ((structure_index or {}).get("graphs") or {}).get("test_links") or {}
+    for ch in changed_file_paths:
+        info = src_map.get(ch) or {}
+        linked = (
+            list(info.get("direct_tests") or [])
+            + list(info.get("indirect_importing_tests") or [])
+            + list(test_links.get(ch) or [])
+        )
+        for tf in linked:
+            if tf in py_set and tf not in impacted_py:
+                impacted_py.append(tf)
+            if tf in js_set and tf not in impacted_js:
+                impacted_js.append(tf)
+
+    if py_tests and impacted_py:
+        return impacted_py, impacted_js or js_tests, "impact_graph_subset"
+    if js_tests and impacted_js and not py_tests:
+        return [], impacted_js, "impact_graph_subset"
+    return py_tests, js_tests, "full_suite"
+
+
+def triage_test_failure(output: str, returncode: int, *, timed_out: bool = False) -> dict[str, str]:
+    """Deterministically classify failure mode (code assertion vs environment/dependency/syntax error)."""
+    if timed_out or returncode == 124:
+        return {"category": "timeout", "detail": "Test execution exceeded configured timeout."}
+    if returncode == 0:
+        return {"category": "passed", "detail": "All executed tests passed."}
+
+    lower = output.lower()
+    if any(k in output for k in ("ModuleNotFoundError", "ImportError", "No module named", "Cannot find module", "ConnectionRefusedError", "ECONNREFUSED")):
+        return {
+            "category": "dependency_or_env_failure",
+            "detail": "Failure involves missing dependency, unresolvable import, or external service connection.",
+        }
+    if any(k in output for k in ("SyntaxError", "IndentationError", "ERRORS")):
+        return {
+            "category": "syntax_or_collection_error",
+            "detail": "Test collection aborted due to syntax or collection-time error.",
+        }
+    if "assertionerror" in lower or "failed " in lower or "expect(" in lower:
+        return {
+            "category": "code_assertion_failure",
+            "detail": "Executed assertions failed against repository code.",
+        }
+    return {"category": "execution_error", "detail": output[-200:] or f"Exited with code {returncode}"}
+
+
+def analyze_property_and_mutation_targets(
+    workspace_dir: Path,
+    changed_file_paths: list[str],
+) -> dict[str, Any]:
+    """Identify pure/invariant functions suited for Hypothesis/fast-check & report optional property/mutation engine status."""
+    hypothesis_available = importlib.util.find_spec("hypothesis") is not None
+    mutmut_available = resolve_binary("mutmut") is not None
+    fast_check_installed = (workspace_dir / "node_modules" / "fast-check").exists()
+    stryker_installed = (workspace_dir / "node_modules" / ".bin" / "stryker").exists()
+
+    property_candidates: list[dict[str, Any]] = []
+    for rel in prioritize_repo_files(changed_file_paths)[:15]:
+        if is_test_file_path(rel):
+            continue
+        p = resolve_within_dir(workspace_dir, rel)
+        if p is None or not p.is_file() or p.stat().st_size > 160_000:
+            continue
+        src = p.read_text(encoding="utf-8", errors="replace")
+        if rel.endswith(".py"):
+            try:
+                tree = ast.parse(src)
+                for node in tree.body:
+                    if isinstance(node, ast.FunctionDef) and not node.name.startswith("_") and node.args.args:
+                        fn_src = ast.get_source_segment(src, node) or ""
+                        has_io = any(tok in fn_src for tok in ("open(", "requests.", "httpx.", "sqlite", "db."))
+                        if not has_io:
+                            args = [a.arg for a in node.args.args if a.arg not in ("self", "cls")]
+                            property_candidates.append(
+                                {
+                                    "file_path": rel,
+                                    "symbol": node.name,
+                                    "line_number": node.lineno,
+                                    "framework": "hypothesis",
+                                    "invariant_hint": f"Verify `{node.name}({', '.join(args)})` preserves idempotence/type bounds across randomized inputs.",
+                                }
+                            )
+            except SyntaxError:
+                continue
+        elif rel.endswith((".ts", ".js")):
+            for m in re.finditer(r"export\s+function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]+)\)", src):
+                line_no = src[: m.start()].count("\n") + 1
+                property_candidates.append(
+                    {
+                        "file_path": rel,
+                        "symbol": m.group(1),
+                        "line_number": line_no,
+                        "framework": "fast-check",
+                        "invariant_hint": f"Add fc.assert(fc.property(...)) checks for exported pure helper `{m.group(1)}({m.group(2).strip()})`.",
+                    }
+                )
+
+    return {
+        "property_testing": {
+            "hypothesis_available": hypothesis_available,
+            "fast_check_installed": fast_check_installed,
+            "executed": False,
+            "candidates": property_candidates[:12],
+        },
+        "mutation_testing": {
+            "mutmut_available": mutmut_available,
+            "stryker_installed": stryker_installed,
+            "executed": False,
+            "status": "optional_unavailable" if not (mutmut_available or stryker_installed) else "available_on_demand",
+        },
+    }
+
+
 async def run_test_and_coverage(
     workspace_dir: Path,
     changed_file_paths: list[str],
     *,
     enable_execution: bool = True,
     plan: dict[str, Any] | None = None,
+    structure_index: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if plan and plan.get("skip_scanners"):
         return {
@@ -213,6 +358,8 @@ async def run_test_and_coverage(
             "runner": "skipped_by_plan",
             "tests_found": 0,
             "test_files": [],
+            "selected_test_files": [],
+            "selection_mode": "skipped_by_plan",
             "js_test_files": [],
             "test_import_map": {},
             "passed": 0,
@@ -220,6 +367,8 @@ async def run_test_and_coverage(
             "skipped": 0,
             "total_coverage_percent": None,
             "file_coverage": {},
+            "failure_triage": {"category": "skipped_by_plan", "detail": "Skipped by ReviewPlanner."},
+            "property_and_mutation": {"property_testing": {"executed": False}, "mutation_testing": {"executed": False}},
             "output": "Test execution skipped by ReviewPlanner (low-risk/docs-only change).",
         }
 
@@ -227,6 +376,14 @@ async def run_test_and_coverage(
     py_tests = discovered["python"]
     js_tests = discovered["js_ts"]
     coverage_map = build_test_coverage_map(workspace_dir, changed_file_paths, discovered)
+    prop_mut = analyze_property_and_mutation_targets(workspace_dir, changed_file_paths)
+    selective_flag = bool(plan.get("selective_test_mode", True)) if plan else True
+    if selective_flag:
+        sel_py, sel_js, sel_mode = select_impacted_tests(
+            changed_file_paths, py_tests, js_tests, coverage_map, structure_index
+        )
+    else:
+        sel_py, sel_js, sel_mode = py_tests, js_tests, "full_suite"
 
     if not enable_execution:
         return {
@@ -323,9 +480,10 @@ async def run_test_and_coverage(
     env["PYTHONPATH"] = str(workspace_dir)
 
     cov_json_path = workspace_dir / ".rb_coverage.json"
+    pytest_targets = sel_py if (sel_mode == "impact_graph_subset" and sel_py) else []
     if coverage_bin:
         run_res = await run_command_capture(
-            [coverage_bin, "run", "--source=.", "-m", "pytest", "-v", "--tb=short"],
+            [coverage_bin, "run", "--source=.", "-m", "pytest", "-v", "--tb=short", *pytest_targets],
             cwd=workspace_dir,
             timeout=90,
             env=env,
@@ -338,7 +496,7 @@ async def run_test_and_coverage(
         )
     else:
         run_res = await run_command_capture(
-            [pytest_bin, "-v", "--tb=short"],
+            [pytest_bin, "-v", "--tb=short", *pytest_targets],
             cwd=workspace_dir,
             timeout=90,
             env=env,
@@ -402,6 +560,10 @@ async def run_test_and_coverage(
         status = "incomplete"
         err_msg = combined[-300:] or f"pytest exited with code {rc} during test collection/execution"
 
+    failure_triage = triage_test_failure(
+        combined, rc, timed_out=bool(run_res.get("timed_out"))
+    )
+
     return {
         "status": status,
         "error": err_msg,
@@ -409,6 +571,8 @@ async def run_test_and_coverage(
         "returncode": rc,
         "tests_found": len(py_tests) + len(js_tests),
         "test_files": py_tests + js_tests,
+        "selected_test_files": sel_py + sel_js,
+        "selection_mode": sel_mode,
         "js_test_files": js_tests,
         "test_import_map": coverage_map,
         "passed": passed,
@@ -417,5 +581,7 @@ async def run_test_and_coverage(
         "total_coverage_percent": total_cov,
         "changed_file_coverage": changed_cov,
         "file_coverage": file_coverage,
+        "failure_triage": failure_triage,
+        "property_and_mutation": prop_mut,
         "output": combined[-4000:],
     }

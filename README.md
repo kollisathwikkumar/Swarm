@@ -126,12 +126,12 @@ Every agent supports independent **Model**, **Base URL**, **API Key** (Fernet-en
 
 | # | Agent | Stage | Default Model | Timeout | Deterministic Context Passed to Model |
 |---|---|---|---|---|---|
-| 1 | **Diff Agent** | Fan-Out (Parallel) | `deepseek-flash` | `70s` | Git diff + prioritized complete files + polyglot symbol & defensive guard index (`implemented_guards_in_full_file`) |
-| 2 | **Style Agent** | Fan-Out (Parallel) | `deepseek-flash` | `70s` | `ruff` lints, Python AST cyclomatic/nesting checks, Node TS syntax parse results, dynamic-import checks, `>=6`-line duplicate block hashes |
-| 3 | **Security Agent** | Fan-Out (Parallel) | `deepseek-v4-pro` | `75s` | `semgrep` (`semgrep_rules.yml`), `bandit`, `gitleaks` (with synthetic test-fixture tagging), `osv-scanner` CVEs, deterministic SSRF/auth/lock guards |
-| 4 | **Test-Coverage Agent** | Fan-Out (Parallel) | `deepseek-flash` | `70s` | `pytest` + `coverage.py` or `vitest` execution telemetry, test suite discovery, and cross-file test-import coverage map |
-| 5 | **Reviewer Manager** | Fan-In Barrier | `deepseek-v4-pro` | `95s` | All 4 agent outputs + disk ground-truth line verification + deterministic tool index + noise filter (`_is_harness_noise`) |
-| 6 | **Fix-Suggestion Agent** | Patch Synthesis | `deepseek-v4-pro` | `85s` (+ `70s` repair) | Prioritized source findings + up to 500-line full context window + `Existing Test Contracts` assertions + `git apply --check` + AST/Node syntax checks |
+| 1 | **Diff Agent** | Fan-Out (Parallel) | `deepseek-flash` | `70s` | Git diff + base-vs-target AST diff (`semantic_counts`, API contracts, config impact) + STAIR caller/dependency slices (`3,000` tokens) |
+| 2 | **Style Agent** | Fan-Out (Parallel) | `deepseek-flash` | `70s` | Cached `ruff` + optional `eslint`/`pylint`, AST complexity/nesting/long-fn/coupling/dead-code/naming checks + token-saver LLM skip on clean/unambiguous lints (`2,000` tokens) |
+| 3 | **Security Agent** | Fan-Out (Parallel) | `deepseek-v4-pro` | `75s` | Cached `semgrep`, `bandit`, `gitleaks`, `osv-scanner`, deterministic taint/authz/crypto engine, optional `codeql`/`trivy` + STAIR slices (`5,000` tokens, +30% High Risk) |
+| 4 | **Test-Coverage Agent** | Fan-Out (Parallel) | `deepseek-flash` | `70s` | Impact-graph selective `pytest`/`vitest`, `coverage.py`, failure triage (`code` vs `env`/`dep`), property/mutation candidates + STAIR slices (`3,500` tokens) |
+| 5 | **Reviewer Manager** | Fan-In Barrier | `deepseek-v4-pro` | `95s` | Specialist outputs + immutable `EV-NNN` `EvidenceStore` + permission/test-claim enforcement + contradiction detector + STAIR slices (`3,000` tokens, +30% High Risk) |
+| 6 | **Fix-Suggestion Agent** | Patch Sandbox | `deepseek-v4-pro` | `85s` (+ `70s` repair) | Strictly `Verified`/`EV-NNN` findings + stale-hash guard + isolated temp-copy validation (`git apply --check`, syntax, optional `mypy`/`tsc`, taint+guard rescan, targeted tests) |
 
 ---
 
