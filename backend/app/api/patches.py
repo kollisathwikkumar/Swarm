@@ -28,6 +28,64 @@ class PatchDecisionRequest(BaseModel):
     note: str | None = None
 
 
+class BatchCommitGitHubRequest(BaseModel):
+    patch_ids: list[str] | None = None
+    review_id: str | None = None
+    note: str | None = None
+
+
+def _resolve_target_branch(repo: Repository, cc: CodeChange) -> str:
+    """Resolve a writable branch name for GitHub Contents API updates."""
+    if cc.source_mode in ("github_commit", "github_full_repo") or not cc.target_branch:
+        return repo.default_branch
+    return cc.target_branch
+
+
+async def _commit_patch_to_github(
+    *,
+    patch: PatchSuggestion,
+    repo: Repository,
+    cc: CodeChange,
+    gh: GitHubClient,
+    actor_email: str,
+    now: datetime,
+) -> tuple[str | None, str]:
+    """Commit a single patch's complete proposed_code safely onto the target GitHub branch."""
+    if is_excluded_path(patch.file_path):
+        raise HTTPException(status_code=403, detail="Cannot commit patch to restricted file path")
+    if repo.source_type != "github":
+        raise HTTPException(status_code=400, detail="GitHub repository required")
+
+    branch = _resolve_target_branch(repo, cc)
+    current_content, file_sha = await gh.get_file_content(
+        repo.owner, repo.name, patch.file_path, branch
+    )
+    if (
+        current_content != patch.original_code
+        and current_content != patch.proposed_code
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Target branch '{branch}' modified '{patch.file_path}' since this review ran. Re-run review before committing.",
+        )
+
+    commit_resp = await gh.commit_file_update(
+        repo.owner,
+        repo.name,
+        path=patch.file_path,
+        branch=branch,
+        message=f"fix(swarm): {patch.title}",
+        new_content=patch.proposed_code,
+        file_sha=file_sha,
+    )
+    commit_sha = (commit_resp.get("commit") or {}).get("sha")
+    patch.approval_status = "applied"
+    patch.applied_ref = commit_sha
+    patch.decided_by = actor_email
+    patch.decided_at = now
+    return commit_sha, branch
+
+
 @router.get("")
 async def list_patches(
     review_id: str | None = None,
@@ -74,6 +132,116 @@ async def list_patches(
             }
             for p, rev, repo in rows
         ]
+    }
+
+
+@router.post("/commit-all-github")
+async def commit_all_patches_to_github(
+    payload: BatchCommitGitHubRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Approve and commit all pending/approved GitHub patches cleanly in batch."""
+    stmt = (
+        select(PatchSuggestion, Review, Repository, CodeChange)
+        .join(Review, PatchSuggestion.review_id == Review.id)
+        .join(Repository, Review.repository_id == Repository.id)
+        .join(CodeChange, Review.code_change_id == CodeChange.id)
+        .where(
+            Repository.user_id == user.id,
+            Repository.source_type == "github",
+            PatchSuggestion.approval_status.in_(["pending_approval", "approved"]),
+        )
+        .order_by(PatchSuggestion.created_at.desc())
+    )
+    if payload.patch_ids:
+        stmt = stmt.where(PatchSuggestion.id.in_(payload.patch_ids))
+    if payload.review_id:
+        stmt = stmt.where(PatchSuggestion.review_id == payload.review_id)
+
+    rows = (await db.execute(stmt)).all()
+    if not rows:
+        raise HTTPException(
+            status_code=400,
+            detail="No pending or approved GitHub patches found to commit.",
+        )
+
+    token = await resolve_github_token(user.id, db)
+    if not token:
+        raise HTTPException(status_code=400, detail="No GitHub token connected")
+    gh = GitHubClient(token)
+
+    now = datetime.now(timezone.utc)
+    committed: list[dict] = []
+    skipped: list[dict] = []
+    errors: list[dict] = []
+    seen_targets: set[tuple[str, str, str]] = set()
+
+    for patch, _rev, repo, cc in rows:
+        branch = _resolve_target_branch(repo, cc)
+        target_key = (repo.id, branch, patch.file_path)
+        if target_key in seen_targets:
+            skipped.append(
+                {
+                    "patch_id": patch.id,
+                    "title": patch.title,
+                    "file_path": patch.file_path,
+                    "reason": "Skipped older patch targeting the same file in this batch.",
+                }
+            )
+            continue
+        seen_targets.add(target_key)
+
+        try:
+            commit_sha, target_branch = await _commit_patch_to_github(
+                patch=patch,
+                repo=repo,
+                cc=cc,
+                gh=gh,
+                actor_email=user.email,
+                now=now,
+            )
+            if payload.note is not None:
+                patch.decision_note = payload.note
+            committed.append(
+                {
+                    "patch_id": patch.id,
+                    "title": patch.title,
+                    "file_path": patch.file_path,
+                    "repository_name": repo.full_name,
+                    "branch": target_branch,
+                    "commit_sha": commit_sha,
+                }
+            )
+        except HTTPException as exc:
+            errors.append(
+                {
+                    "patch_id": patch.id,
+                    "title": patch.title,
+                    "file_path": patch.file_path,
+                    "detail": str(exc.detail),
+                }
+            )
+        except GitHubAPIError as exc:
+            errors.append(
+                {
+                    "patch_id": patch.id,
+                    "title": patch.title,
+                    "file_path": patch.file_path,
+                    "detail": exc.message,
+                }
+            )
+
+    if committed:
+        await db.commit()
+
+    return {
+        "committed_count": len(committed),
+        "skipped_count": len(skipped),
+        "failed_count": len(errors),
+        "committed": committed,
+        "skipped": skipped,
+        "errors": errors,
     }
 
 
@@ -143,44 +311,19 @@ async def decide_patch(
         except GitHubAPIError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.message)
     elif payload.action == "commit_to_github_branch":
-        if is_excluded_path(patch.file_path):
-            raise HTTPException(status_code=403, detail="Cannot commit patch to restricted file path")
-        if repo.source_type != "github":
-            raise HTTPException(status_code=400, detail="GitHub repository required")
         token = await resolve_github_token(user.id, db)
         if not token:
             raise HTTPException(status_code=400, detail="No GitHub token connected")
         gh = GitHubClient(token)
-        # Specific-commit reviews set cc.target_branch = sha[:8], which is not a writable branch name.
-        branch = (
-            repo.default_branch
-            if cc.source_mode in ("github_commit", "github_full_repo") or not cc.target_branch
-            else cc.target_branch
-        )
         try:
-            current_content, file_sha = await gh.get_file_content(
-                repo.owner, repo.name, patch.file_path, branch
+            commit_sha, _branch = await _commit_patch_to_github(
+                patch=patch,
+                repo=repo,
+                cc=cc,
+                gh=gh,
+                actor_email=user.email,
+                now=now,
             )
-            if (
-                current_content != patch.original_code
-                and current_content != patch.proposed_code
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Target branch '{branch}' modified '{patch.file_path}' since this review ran. Re-run review before committing.",
-                )
-            commit_resp = await gh.commit_file_update(
-                repo.owner,
-                repo.name,
-                path=patch.file_path,
-                branch=branch,
-                message=f"fix(swarm): {patch.title}",
-                new_content=patch.proposed_code,
-                file_sha=file_sha,
-            )
-            commit_sha = (commit_resp.get("commit") or {}).get("sha")
-            patch.approval_status = "applied"
-            patch.applied_ref = commit_sha
             result_info["commit_sha"] = commit_sha
         except GitHubAPIError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.message)

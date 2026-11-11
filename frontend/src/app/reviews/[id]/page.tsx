@@ -16,7 +16,7 @@ import {
   Wrench,
   X,
 } from "lucide-react";
-import { apiFetch, connectResilientWebSocket, getApiBase, getStoredToken } from "@/lib/api";
+import { apiFetch, commitAllPatchesToGithub, connectResilientWebSocket, getApiBase, getStoredToken } from "@/lib/api";
 import { useResolvedTheme } from "@/lib/theme";
 import type {
   AgentRunItem,
@@ -318,6 +318,22 @@ export default function ConsolidatedCodeReviewPage() {
       await loadDetail();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Patch action failed");
+    } finally {
+      setBusyAction(false);
+    }
+  };
+
+  const handleCommitAllPatchesToGithub = async () => {
+    setBusyAction(true);
+    setError("");
+    setStatusNotice("");
+    try {
+      const { noticeMsg, errorMsg } = await commitAllPatchesToGithub({ review_id: reviewId });
+      if (noticeMsg) setStatusNotice(noticeMsg);
+      if (errorMsg) setError(errorMsg);
+      await loadDetail();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Batch commit to GitHub failed");
     } finally {
       setBusyAction(false);
     }
@@ -708,6 +724,31 @@ export default function ConsolidatedCodeReviewPage() {
       {/* Tab 3: Fix Suggestions (Monaco DiffEditor + Honest Verification Output) */}
       {activeTab === "patches" && (
         <div className="space-y-4">
+          {review.source_type === "github" &&
+            patch_suggestions.some(
+              (p) => p.approval_status === "pending_approval" || p.approval_status === "approved"
+            ) && (
+              <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border bg-card px-4 py-3">
+                <p className="text-xs text-muted-foreground">
+                  Approve and commit all pending/approved fixes for this review directly to GitHub.
+                </p>
+                <button
+                  type="button"
+                  disabled={busyAction}
+                  onClick={handleCommitAllPatchesToGithub}
+                  className="inline-flex min-h-9 items-center gap-1.5 rounded-lg bg-primary px-3.5 py-1.5 text-xs font-semibold text-primary-foreground hover:opacity-90 disabled:opacity-50"
+                >
+                  <Github className="h-3.5 w-3.5" aria-hidden="true" />
+                  Approve &amp; Commit All to GitHub (
+                  {
+                    patch_suggestions.filter(
+                      (p) => p.approval_status === "pending_approval" || p.approval_status === "approved"
+                    ).length
+                  }
+                  )
+                </button>
+              </div>
+            )}
           {patch_suggestions.length === 0 ? (
             <div className="rounded-xl border border-border bg-card p-8 text-center text-sm text-muted-foreground">
               No fix suggestions generated for this review.
@@ -757,18 +798,18 @@ export default function ConsolidatedCodeReviewPage() {
                   <div className="flex flex-wrap items-center justify-end gap-2">
                     <button
                       type="button"
-                      disabled={busyAction}
+                      disabled={busyAction || patch.approval_status === "applied"}
                       onClick={() => handlePatchDecision(patch, "reject")}
-                      className="inline-flex min-h-10 items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-rose-700 hover:bg-rose-500/10 dark:text-rose-300"
+                      className="inline-flex min-h-10 items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-rose-700 hover:bg-rose-500/10 disabled:opacity-50 dark:text-rose-300"
                     >
                       <X className="h-3.5 w-3.5" aria-hidden="true" />
                       Reject
                     </button>
                     <button
                       type="button"
-                      disabled={busyAction}
+                      disabled={busyAction || patch.approval_status === "approved" || patch.approval_status === "applied"}
                       onClick={() => handlePatchDecision(patch, "approve")}
-                      className="inline-flex min-h-10 items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-emerald-700 hover:bg-emerald-500/10 dark:text-emerald-300"
+                      className="inline-flex min-h-10 items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-emerald-700 hover:bg-emerald-500/10 disabled:opacity-50 dark:text-emerald-300"
                     >
                       <Check className="h-3.5 w-3.5" aria-hidden="true" />
                       Approve Patch
@@ -776,32 +817,32 @@ export default function ConsolidatedCodeReviewPage() {
                     {review.source_type === "local" && (
                       <button
                         type="button"
-                        disabled={busyAction || !patch.applicability_verified}
+                        disabled={busyAction || !patch.applicability_verified || patch.approval_status === "applied"}
                         onClick={() => handlePatchDecision(patch, "apply_local")}
                         className="inline-flex min-h-10 items-center gap-1.5 rounded-lg bg-primary px-3.5 py-1.5 text-xs font-semibold text-primary-foreground disabled:opacity-50"
                       >
-                        Approve &amp; Apply Locally
+                        {patch.approval_status === "applied" ? "Applied Locally" : "Approve & Apply Locally"}
                       </button>
                     )}
                     {review.source_type === "github" && code_change.pr_number && (
-                      <>
-                        <button
-                          type="button"
-                          disabled={busyAction}
-                          onClick={() => handlePatchDecision(patch, "publish_github_suggestion")}
-                          className="inline-flex min-h-10 items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs font-semibold hover:bg-muted"
-                        >
-                          Post PR Suggestion Comment
-                        </button>
-                        <button
-                          type="button"
-                          disabled={busyAction}
-                          onClick={() => handlePatchDecision(patch, "commit_to_github_branch")}
-                          className="inline-flex min-h-10 items-center gap-1.5 rounded-lg bg-primary px-3.5 py-1.5 text-xs font-semibold text-primary-foreground"
-                        >
-                          Approve &amp; Commit to GitHub Branch
-                        </button>
-                      </>
+                      <button
+                        type="button"
+                        disabled={busyAction}
+                        onClick={() => handlePatchDecision(patch, "publish_github_suggestion")}
+                        className="inline-flex min-h-10 items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs font-semibold hover:bg-muted disabled:opacity-50"
+                      >
+                        Post PR Suggestion Comment
+                      </button>
+                    )}
+                    {review.source_type === "github" && (
+                      <button
+                        type="button"
+                        disabled={busyAction || patch.approval_status === "applied" || patch.approval_status === "rejected"}
+                        onClick={() => handlePatchDecision(patch, "commit_to_github_branch")}
+                        className="inline-flex min-h-10 items-center gap-1.5 rounded-lg bg-primary px-3.5 py-1.5 text-xs font-semibold text-primary-foreground disabled:opacity-50"
+                      >
+                        {patch.approval_status === "applied" ? "Committed to GitHub" : "Approve & Commit to GitHub"}
+                      </button>
                     )}
                   </div>
                 </article>

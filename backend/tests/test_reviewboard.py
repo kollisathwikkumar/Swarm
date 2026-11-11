@@ -636,5 +636,178 @@ def test_audit_hardening_git_refs_paths_urls_and_patch_assembly(tmp_path: Path):
     assert assembled == "line1\nfixed2\nfixed3\nline4\n"
 
 
+@pytest.mark.asyncio
+async def test_batch_commit_all_patches_to_github(tmp_path: Path, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    from httpx import ASGITransport, AsyncClient
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+    from app.database.session import Base, get_db
+    from app.integrations.github_client import GitHubClient
+    from app.main import app
+    from app.models.tables import CodeChange, PatchSuggestion, Repository, Review, User
+
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'batch_patches.db'}"
+    test_engine = create_async_engine(db_url, echo=False)
+    test_session_maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+
+    async def override_get_db():
+        async with test_session_maker() as s:
+            yield s
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    async def fake_resolve_token(_user_id: str, _db: AsyncSession) -> str:
+        return "ghp_test_token_1234567890"
+
+    async def fake_get_file_content(self, owner: str, repo: str, path: str, ref: str) -> tuple[str, str]:
+        if path == "src/stale.py":
+            return "upstream modified content\n", "sha_stale"
+        return f"orig {path}\n", f"sha_{path}"
+
+    committed_calls: list[dict] = []
+
+    async def fake_commit_file_update(
+        self, owner: str, repo: str, *, path: str, branch: str, message: str, new_content: str, file_sha: str
+    ) -> dict:
+        committed_calls.append({"path": path, "branch": branch, "message": message})
+        return {"commit": {"sha": f"commit_sha_{len(committed_calls)}"}}
+
+    monkeypatch.setattr("app.api.patches.resolve_github_token", fake_resolve_token)
+    monkeypatch.setattr(GitHubClient, "get_file_content", fake_get_file_content)
+    monkeypatch.setattr(GitHubClient, "commit_file_update", fake_commit_file_update)
+
+    try:
+        async with test_engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        base_t = datetime.now(timezone.utc)
+        async with test_session_maker() as db:
+            user = User(email="workspace@reviewboard.local", name="Dev", password_hash="x")
+            db.add(user)
+            await db.flush()
+            repo = Repository(
+                user_id=user.id,
+                source_type="github",
+                full_name="owner/demo",
+                owner="owner",
+                name="demo",
+                default_branch="main",
+            )
+            db.add(repo)
+            await db.flush()
+            cc = CodeChange(
+                repository_id=repo.id,
+                source_mode="github_commit",
+                base_branch="abc12345",
+                target_branch="def67890",
+                base_commit="abc12345" * 5,
+                target_commit="def67890" * 5,
+                diff_text="diff",
+            )
+            db.add(cc)
+            await db.flush()
+            rev = Review(
+                repository_id=repo.id,
+                code_change_id=cc.id,
+                base_commit=cc.base_commit,
+                target_commit=cc.target_commit,
+                review_status="completed",
+                recommendation="Request Changes",
+            )
+            db.add(rev)
+            await db.flush()
+
+            p_newer = PatchSuggestion(
+                review_id=rev.id,
+                file_path="src/a.py",
+                title="Fix A (newest)",
+                original_code="orig src/a.py\n",
+                proposed_code="fixed src/a.py\n",
+                unified_diff="diff",
+                explanation="fix",
+                applicability_verified=True,
+                approval_status="pending_approval",
+                created_at=base_t + timedelta(seconds=10),
+            )
+            p_older_same_file = PatchSuggestion(
+                review_id=rev.id,
+                file_path="src/a.py",
+                title="Fix A (older duplicate)",
+                original_code="orig src/a.py\n",
+                proposed_code="older fixed src/a.py\n",
+                unified_diff="diff",
+                explanation="old fix",
+                applicability_verified=True,
+                approval_status="approved",
+                created_at=base_t + timedelta(seconds=1),
+            )
+            p_approved_b = PatchSuggestion(
+                review_id=rev.id,
+                file_path="src/b.py",
+                title="Fix B",
+                original_code="orig src/b.py\n",
+                proposed_code="fixed src/b.py\n",
+                unified_diff="diff",
+                explanation="fix b",
+                applicability_verified=True,
+                approval_status="approved",
+                created_at=base_t + timedelta(seconds=8),
+            )
+            p_stale = PatchSuggestion(
+                review_id=rev.id,
+                file_path="src/stale.py",
+                title="Fix Stale",
+                original_code="orig src/stale.py\n",
+                proposed_code="fixed src/stale.py\n",
+                unified_diff="diff",
+                explanation="stale",
+                applicability_verified=True,
+                approval_status="pending_approval",
+                created_at=base_t + timedelta(seconds=5),
+            )
+            p_already_applied = PatchSuggestion(
+                review_id=rev.id,
+                file_path="src/done.py",
+                title="Already Applied",
+                original_code="orig src/done.py\n",
+                proposed_code="fixed src/done.py\n",
+                unified_diff="diff",
+                explanation="done",
+                applicability_verified=True,
+                approval_status="applied",
+                created_at=base_t + timedelta(seconds=9),
+            )
+            db.add_all([p_newer, p_older_same_file, p_approved_b, p_stale, p_already_applied])
+            await db.commit()
+            id_newer, id_b, id_stale = p_newer.id, p_approved_b.id, p_stale.id
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            res = await client.post("/api/patches/commit-all-github", json={})
+            assert res.status_code == 200
+            data = res.json()
+            assert data["committed_count"] == 2
+            assert data["skipped_count"] == 1
+            assert data["failed_count"] == 1
+            assert all(c["branch"] == "main" for c in data["committed"])
+            assert {c["patch_id"] for c in data["committed"]} == {id_newer, id_b}
+            assert data["errors"][0]["patch_id"] == id_stale
+
+        async with test_session_maker() as db:
+            rows = {
+                p.id: p
+                for p in (await db.execute(select(PatchSuggestion))).scalars().all()
+            }
+            assert rows[id_newer].approval_status == "applied"
+            assert rows[id_b].approval_status == "applied"
+            assert rows[id_stale].approval_status == "pending_approval"
+    finally:
+        app.dependency_overrides.clear()
+        await test_engine.dispose()
+
+
+
 
 

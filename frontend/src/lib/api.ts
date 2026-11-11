@@ -93,3 +93,55 @@ export async function apiFetch<T>(
   }
   return (await resp.json()) as T;
 }
+
+export interface BatchCommitGitHubResponse {
+  committed_count: number;
+  skipped_count: number;
+  failed_count: number;
+  committed: Array<{
+    patch_id: string;
+    title: string;
+    file_path: string;
+    repository_name: string;
+    branch: string;
+    commit_sha?: string | null;
+  }>;
+  skipped: Array<{
+    patch_id: string;
+    title: string;
+    file_path: string;
+    reason: string;
+  }>;
+  errors: Array<{
+    patch_id: string;
+    title: string;
+    file_path: string;
+    detail: string;
+  }>;
+}
+
+export async function commitAllPatchesToGithub(payload: {
+  patch_ids?: string[];
+  review_id?: string;
+}): Promise<{ noticeMsg: string; errorMsg: string; res: BatchCommitGitHubResponse }> {
+  const res = await apiFetch<BatchCommitGitHubResponse>("/api/patches/commit-all-github", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  const noticeParts: string[] = [];
+  if (res.committed_count > 0) {
+    noticeParts.push(
+      `Approved and committed ${res.committed_count} patch${res.committed_count === 1 ? "" : "es"} to GitHub.`
+    );
+  }
+  if (res.skipped_count > 0) {
+    noticeParts.push(`${res.skipped_count} duplicate file patch skipped.`);
+  }
+  const errorMsg =
+    res.failed_count > 0
+      ? `Failed committing ${res.failed_count} patch${res.failed_count === 1 ? "" : "es"}: ${res.errors
+          .map((e) => `${e.file_path} (${e.detail})`)
+          .join("; ")}`
+      : "";
+  return { noticeMsg: noticeParts.join(" "), errorMsg, res };
+}
