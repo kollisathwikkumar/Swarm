@@ -1,0 +1,120 @@
+rules:
+  - id: python-sql-injection-format
+    pattern-either:
+      - pattern: '$CURSOR.execute(f"...")'
+      - pattern: '$CURSOR.execute(f"...", ...)'
+      - pattern: '$CURSOR.execute("..." + $VAR)'
+      - pattern: '$CURSOR.execute("..." + $VAR, ...)'
+      - pattern: '$CURSOR.execute("..." % $VAR)'
+      - pattern: '$CURSOR.execute("...".format(...))'
+    message: Potential SQL injection via dynamic string interpolation in SQL execute(). Use parameterized queries instead.
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: CWE-89
+      impact: HIGH
+      confidence: HIGH
+
+  - id: python-command-injection-shell-true
+    pattern-either:
+      - pattern: 'subprocess.run(..., shell=True, ...)'
+      - pattern: 'subprocess.Popen(..., shell=True, ...)'
+      - pattern: 'subprocess.call(..., shell=True, ...)'
+      - pattern: 'os.system(...)'
+    message: Potential command injection via shell=True or os.system(). Pass argument lists with shell=False.
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: CWE-78
+      impact: HIGH
+
+  - id: python-code-injection-eval-exec
+    pattern-either:
+      - pattern: 'eval(...)'
+      - pattern: 'exec(...)'
+    message: Dangerous use of eval()/exec() can execute arbitrary code.
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: CWE-95
+      impact: HIGH
+
+  - id: python-unsafe-deserialization
+    pattern-either:
+      - pattern: 'pickle.loads(...)'
+      - pattern: 'pickle.load(...)'
+      - pattern: 'yaml.load($DATA)'
+    message: Unsafe deserialization (pickle or yaml.load without SafeLoader) can lead to remote code execution.
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: CWE-502
+      impact: HIGH
+
+  - id: python-tls-verification-disabled
+    pattern-either:
+      - pattern: 'requests.$METHOD(..., verify=False, ...)'
+      - pattern: 'httpx.Client(..., verify=False, ...)'
+      - pattern: 'httpx.AsyncClient(..., verify=False, ...)'
+    message: TLS certificate verification is disabled (verify=False), exposing connections to MitM attacks.
+    languages: [python]
+    severity: WARNING
+    metadata:
+      cwe: CWE-295
+      impact: MEDIUM
+
+  - id: python-weak-crypto-hash
+    pattern-either:
+      - pattern: 'hashlib.md5(...)'
+      - pattern: 'hashlib.sha1(...)'
+    message: Weak cryptographic hash (MD5/SHA1) used; prefer SHA-256+ or Argon2/PBKDF2 for passwords.
+    languages: [python]
+    severity: WARNING
+    metadata:
+      cwe: CWE-328
+
+  - id: python-hardcoded-credential-assignment
+    pattern-either:
+      - pattern: 'API_KEY = "..."'
+      - pattern: 'SECRET_KEY = "..."'
+      - pattern: 'PASSWORD = "..."'
+      - pattern: 'AWS_SECRET_ACCESS_KEY = "..."'
+      - pattern: 'DB_PASSWORD = "..."'
+      - pattern: '$OBJ.api_key = "..."'
+      - pattern: '$OBJ.secret_key = "..."'
+    message: Possible hardcoded credential or secret literal in source code. Load secrets from environment variables.
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: CWE-798
+      impact: HIGH
+
+  - id: python-flask-fastapi-debug-or-cors-wildcard
+    pattern-either:
+      - pattern: '$APP.run(..., debug=True, ...)'
+      - pattern: 'CORSMiddleware(..., allow_origins=["*"], ...)'
+    message: Permissive debug mode or wildcard CORS configuration detected.
+    languages: [python]
+    severity: WARNING
+    metadata:
+      cwe: CWE-942
+
+  - id: js-ts-xss-and-eval
+    pattern-either:
+      - pattern: 'eval(...)'
+      - pattern: 'new Function(...)'
+      - pattern: '$EL.innerHTML = $VAL'
+      - pattern: 'document.write(...)'
+    message: Potential Cross-Site Scripting (XSS) or unsafe dynamic code evaluation.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      cwe: CWE-79
+
+  - id: js-ts-dangerously-set-inner-html
+    pattern-regex: 'dangerouslySetInnerHTML\s*='
+    message: Use of dangerouslySetInnerHTML can expose the UI to XSS if HTML is not sanitized.
+    languages: [javascript, typescript]
+    severity: WARNING
+    metadata:
+      cwe: CWE-79
