@@ -25,10 +25,7 @@ def is_sensitive_path(rel_path: str) -> bool:
     if norm == ".git" or norm.startswith(".git/"):
         return True
     name = Path(norm).name
-    for pat in SENSITIVE_PATTERNS:
-        if fnmatch.fnmatch(norm, pat) or fnmatch.fnmatch(name, pat):
-            return True
-    return False
+    return any(fnmatch.fnmatch(norm, pat) or fnmatch.fnmatch(name, pat) for pat in SENSITIVE_PATTERNS)
 
 
 def validate_repo_path(raw_path: str, allowed_root: Path | None = None) -> Path:
@@ -48,7 +45,7 @@ def inspect_repository(repo_path: Path) -> dict[str, Any]:
     repo = GitRepo(str(repo_path))
     try:
         active_branch = repo.active_branch.name
-    except Exception:
+    except TypeError:
         active_branch = "HEAD"
 
     branches = [h.name for h in repo.heads]

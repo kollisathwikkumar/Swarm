@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import shutil
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import httpx
 from sqlalchemy import delete, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import AGENT_METADATA, get_settings
 from app.database.session import async_session_maker
-from app.integrations.github_client import GitHubClient
+from app.integrations.github_client import GitHubAPIError, GitHubClient
 from app.models.tables import (
     AgentLLMConfig,
     AgentRun,
@@ -38,12 +41,31 @@ from app.services.crypto import decrypt_secret
 from app.services.git_workspace import prepare_review_workspace
 from app.services.websocket_manager import ws_manager
 
+logger = logging.getLogger(__name__)
 _ACTIVE_TASKS: set[asyncio.Task[Any]] = set()
+
+
+async def seed_agent_runs(
+    db: AsyncSession,
+    review_id: str,
+    configs: dict[str, AgentExecutionConfig],
+) -> None:
+    """Create initial queued AgentRun rows for all 6 agents before launching a review."""
+    for key, meta in AGENT_METADATA.items():
+        db.add(
+            AgentRun(
+                review_id=review_id,
+                agent_name=key,
+                agent_label=meta["label"],
+                model_used=configs[key].model,
+                status="queued",
+            )
+        )
 
 
 async def persist_review_stopped(review_id: str) -> dict[str, Any]:
     """Persist stopped status for a review and any unfinished agent runs, then notify WebSocket clients."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     async with async_session_maker() as db:
         rev = (await db.execute(select(Review).where(Review.id == review_id))).scalar_one_or_none()
         if not rev:
@@ -52,8 +74,7 @@ async def persist_review_stopped(review_id: str) -> dict[str, Any]:
             return {"review_id": review_id, "status": rev.review_status, "stopped": False}
 
         rev.review_status = "stopped"
-        if rev.recommendation == "Pending":
-            rev.recommendation = "Incomplete"
+        rev.recommendation = "Incomplete"
         rev.recommendation_reason = "Stopped by user before completion."
         rev.completed_at = rev.completed_at or now
 
@@ -191,7 +212,7 @@ class ReviewCoordinator:
                 return
 
             review.review_status = "running"
-            review.started_at = datetime.now(timezone.utc)
+            review.started_at = datetime.now(UTC)
             await db.commit()
 
             await ws_manager.emit(
@@ -275,7 +296,7 @@ class ReviewCoordinator:
                             if ar:
                                 if event_type in ("agent_started", "fan_in_started"):
                                     ar.status = "running"
-                                    ar.started_at = datetime.now(timezone.utc)
+                                    ar.started_at = datetime.now(UTC)
                                 elif event_type == "agent_progress":
                                     ar.status = "running"
                                     if payload.get("message"):
@@ -292,17 +313,17 @@ class ReviewCoordinator:
                                         ar.summary = str(payload["reason"])
                                     if payload.get("duration_ms") is not None:
                                         ar.duration_ms = int(payload["duration_ms"])
-                                    ar.completed_at = datetime.now(timezone.utc)
+                                    ar.completed_at = datetime.now(UTC)
                                 elif event_type == "agent_failed":
                                     ar.status = str(payload.get("status") or "failed")
                                     if payload.get("error"):
                                         ar.error_message = str(payload["error"])
                                     if payload.get("duration_ms") is not None:
                                         ar.duration_ms = int(payload["duration_ms"])
-                                    ar.completed_at = datetime.now(timezone.utc)
+                                    ar.completed_at = datetime.now(UTC)
                                 await ev_db.commit()
-                    except Exception:
-                        pass
+                    except SQLAlchemyError as exc:
+                        logger.debug("Ignoring telemetry persistence error for %s: %s", rid, exc)
 
                 workflow = build_review_workflow(emit_and_persist)
                 wf_result = await asyncio.wait_for(workflow.run(initial_state), timeout=240.0)
@@ -333,7 +354,7 @@ class ReviewCoordinator:
                             raw_output=res.get("raw_output", {}),
                             error_message=res.get("error_message"),
                             duration_ms=int(res.get("duration_ms", 0)),
-                            completed_at=datetime.now(timezone.utc),
+                            completed_at=datetime.now(UTC),
                         )
                     )
 
@@ -391,7 +412,7 @@ class ReviewCoordinator:
                 review.recommendation_reason = final_state.recommendation_reason
                 review.review_status = "completed"
                 review.shared_state_json = final_state.to_snapshot()
-                review.completed_at = datetime.now(timezone.utc)
+                review.completed_at = datetime.now(UTC)
 
                 md_report = _build_markdown_report(review, repo, final_state)
                 db.add(
@@ -438,7 +459,7 @@ class ReviewCoordinator:
                             event=gh_event,
                         )
                         review.github_review_id = gh_resp.get("id")
-                        review.github_published_at = datetime.now(timezone.utc)
+                        review.github_published_at = datetime.now(UTC)
                         gh_state = (
                             "success"
                             if final_state.recommendation == "Approve"
@@ -451,10 +472,10 @@ class ReviewCoordinator:
                             repo.name,
                             review.target_commit,
                             state=gh_state,
-                            description=f"ReviewBoard: {final_state.recommendation} ({len(final_state.findings)} findings)",
+                            description=f"Swarm: {final_state.recommendation} ({len(final_state.findings)} findings)",
                         )
-                    except Exception:
-                        pass
+                    except (GitHubAPIError, httpx.HTTPError) as exc:
+                        logger.warning("Auto-publish to GitHub failed for review %s: %s", review_id, exc)
 
                 await db.commit()
 
@@ -471,21 +492,22 @@ class ReviewCoordinator:
             except (asyncio.CancelledError, ReviewCancelledError):
                 try:
                     await db.rollback()
-                except Exception:
-                    pass
+                except SQLAlchemyError as rb_exc:
+                    logger.debug("Rollback on cancel failed for %s: %s", review_id, rb_exc)
                 await asyncio.shield(persist_review_stopped(review_id))
             except Exception as exc:
                 if is_review_cancelled(review_id):
                     try:
                         await db.rollback()
-                    except Exception:
-                        pass
+                    except SQLAlchemyError as rb_exc:
+                        logger.debug("Rollback on late error failed for %s: %s", review_id, rb_exc)
                     await asyncio.shield(persist_review_stopped(review_id))
                     return
+                logger.exception("Review execution error for %s", review_id)
                 review.review_status = "failed"
                 review.recommendation = "Incomplete"
                 review.recommendation_reason = f"Review execution error: {exc}"
-                review.completed_at = datetime.now(timezone.utc)
+                review.completed_at = datetime.now(UTC)
                 await db.commit()
                 await ws_manager.emit(
                     review_id,
@@ -499,8 +521,8 @@ class ReviewCoordinator:
                         ws_root = get_settings().resolved_workspace_dir
                         if ws_root in workspace_dir.resolve().parents:
                             shutil.rmtree(workspace_dir, ignore_errors=True)
-                    except Exception:
-                        pass
+                    except OSError as rm_exc:
+                        logger.debug("Workspace cleanup skipped for %s: %s", review_id, rm_exc)
 
 
 def launch_review_job(review_id: str) -> None:

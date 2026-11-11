@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -18,7 +19,9 @@ from app.orchestration.shared_state import (
 from app.scanners.code_engines import prioritize_repo_files, read_prioritized_workspace_files
 from app.scanners.style_tools import run_style_scanners
 
-SYSTEM_PROMPT = """You are the Style Agent in ReviewBoard, an automated multi-agent code review system.
+logger = logging.getLogger(__name__)
+
+SYSTEM_PROMPT = """You are the Style Agent in Swarm, an automated multi-agent code review system.
 Review the deterministic style/linter outputs (Ruff, AST complexity, duplicate detection) and the actual changed code.
 Identify formatting inconsistencies, naming convention violations, code duplication, and readability/maintainability issues.
 Return strict JSON with this schema:
@@ -132,16 +135,24 @@ class StyleAgentExecutor(Executor):
                     )
                 )
 
+            incomplete_tools = [
+                k
+                for k, v in style_res.items()
+                if isinstance(v, dict) and v.get("status") in ("error", "incomplete", "tool_unavailable")
+            ]
+            status = "incomplete" if incomplete_tools else "completed"
+            err_msg = f"Incomplete style scanners: {', '.join(incomplete_tools)}" if incomplete_tools else None
             duration_ms = int((time.perf_counter() - t0) * 1000)
             out = AgentExecutionOutput(
                 agent_name="style_agent",
                 agent_label=cfg.label,
                 model_used=cfg.model,
-                status="completed",
+                status=status,
                 summary=str(llm_out.get("summary") or f"Found {len(findings)} style/quality item(s)."),
                 findings=findings,
                 tool_results=style_res,
                 raw_output=llm_out,
+                error_message=err_msg,
                 duration_ms=duration_ms,
             )
             await self._emit(
@@ -179,6 +190,7 @@ class StyleAgentExecutor(Executor):
             )
             await ctx.send_message(out)
         except Exception as exc:
+            logger.exception("Style Agent failed")
             duration_ms = int((time.perf_counter() - t0) * 1000)
             out = AgentExecutionOutput(
                 agent_name="style_agent",
@@ -186,6 +198,7 @@ class StyleAgentExecutor(Executor):
                 model_used=cfg.model,
                 status="failed",
                 summary="Style Agent failed.",
+                tool_results=style_res,
                 error_message=str(exc),
                 duration_ms=duration_ms,
             )

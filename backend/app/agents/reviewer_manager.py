@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -13,6 +14,8 @@ from app.agents.llm_factory import MissingAPIKeyError, run_structured_agent
 from app.orchestration.cancellation import ReviewCancelledError, is_review_cancelled
 from app.orchestration.shared_state import AgentExecutionOutput, ReviewState
 from app.scanners.code_engines import is_test_fixture_hit, read_prioritized_workspace_files
+
+logger = logging.getLogger(__name__)
 
 SEVERITY_ORDER = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
 
@@ -43,7 +46,7 @@ LLM_ONLY_TOOLS = {
     "llm-test-review",
 }
 
-SYSTEM_PROMPT = """You are the Reviewer Manager (Fan-In Adversarial Verification & Decision Engine) in ReviewBoard.
+SYSTEM_PROMPT = """You are the Reviewer Manager (Fan-In Adversarial Verification & Decision Engine) in Swarm.
 You receive:
 1. Candidate findings from the four parallel agents (Diff, Style, Security, Test-Coverage).
 2. Deterministic Scanner Hits Index (`deterministic_tool_index`), Cross-File Test-Import Coverage Map (`test_import_map`), Polyglot Symbols/Guards (`polyglot_symbols`), and COMPLETE line-numbered ground-truth source files (`ground_truth_files`).
@@ -55,7 +58,7 @@ Your strict verification & consolidation duties:
      * Claims a validation, URL check, or citation check is missing when it is implemented in `ground_truth_files` or `implemented_guards_in_full_file`.
      * Claims a test suite "only tests happy paths" when error/edge tests exist in `test_import_map.test_suites` or the test file.
      * Claims a module has no test coverage when `test_import_map.source_file_test_map[file].has_any_unmocked_test` is true.
-     * Complains about ReviewBoard's own test runner (`pytest` finding 0 Python tests on a TS repo).
+     * Complains about Swarm's own test runner (`pytest` finding 0 Python tests on a TS repo).
    - Record every discarded finding cleanly in `"rejected_false_positives"` with exact contradictory evidence.
 2. **Deduplicate Overlapping Findings**:
    - Merge findings covering the same underlying defect + file + line/module into one canonical finding, listing all contributing sources in `deduplicated_sources`.
@@ -119,28 +122,30 @@ def _deterministic_deduplicate(raw_findings: list[dict[str, Any]]) -> list[dict[
         fp = str(f.get("file_path") or "").strip()
         ln = int(f.get("line_number") or 0)
         cat = str(f.get("category") or "general")
+        sev = str(f.get("severity") or "Low").title()
         key = (fp, ln, cat)
         src = str(f.get("agent") or "Agent")
         if f.get("tool_name"):
             src = f"{src} ({f['tool_name']})"
         if key not in merged:
             copy = dict(f)
+            copy["severity"] = sev
             copy["deduplicated_sources"] = [src]
             merged[key] = copy
         else:
             existing = merged[key]
             if src not in existing["deduplicated_sources"]:
                 existing["deduplicated_sources"].append(src)
-            if SEVERITY_ORDER.get(f.get("severity", "Low"), 3) < SEVERITY_ORDER.get(
-                existing.get("severity", "Low"), 3
+            if SEVERITY_ORDER.get(sev, 3) < SEVERITY_ORDER.get(
+                str(existing.get("severity") or "Low").title(), 3
             ):
-                existing["severity"] = f["severity"]
+                existing["severity"] = sev
             if f.get("verification_status") == "Verified":
                 existing["verification_status"] = "Verified"
     result = list(merged.values())
     result.sort(
         key=lambda x: (
-            SEVERITY_ORDER.get(x.get("severity", "Low"), 3),
+            SEVERITY_ORDER.get(str(x.get("severity") or "Low").title(), 3),
             x.get("file_path", ""),
             x.get("line_number") or 0,
         )
@@ -150,10 +155,16 @@ def _deterministic_deduplicate(raw_findings: list[dict[str, Any]]) -> list[dict[
     return result
 
 
+def _agent_field(agent: AgentExecutionOutput | dict[str, Any], key: str, default: Any = None) -> Any:
+    if isinstance(agent, dict):
+        return agent.get(key, default)
+    return getattr(agent, key, default)
+
+
 def _evaluate_review_policy(
     state: ReviewState,
     findings: list[dict[str, Any]],
-    agent_outputs: list[AgentExecutionOutput],
+    agent_outputs: list[AgentExecutionOutput] | list[dict[str, Any]],
 ) -> tuple[str, str, list[dict[str, Any]]]:
     policy = state.policy or {}
     block_critical = bool(policy.get("block_on_critical", True))
@@ -161,37 +172,61 @@ def _evaluate_review_policy(
     require_tests_pass = bool(policy.get("require_tests_pass", True))
     require_all_scans = bool(policy.get("require_all_mandatory_scans", True))
 
-    incomplete_agents = [a.agent_label for a in agent_outputs if a.status in ("incomplete", "failed")]
-    test_agent = next((a for a in agent_outputs if a.agent_name == "test_coverage_agent"), None)
-    tests_failed = int((test_agent.tool_results or {}).get("failed", 0)) if test_agent else 0
+    stopped_agents = [
+        str(_agent_field(a, "agent_label") or _agent_field(a, "agent_name") or "Agent")
+        for a in agent_outputs
+        if _agent_field(a, "status") == "stopped"
+    ]
+    incomplete_agents = [
+        str(_agent_field(a, "agent_label") or _agent_field(a, "agent_name") or "Agent")
+        for a in agent_outputs
+        if _agent_field(a, "status") in ("incomplete", "failed")
+    ]
+    test_agent = next(
+        (a for a in agent_outputs if _agent_field(a, "agent_name") == "test_coverage_agent"),
+        None,
+    )
+    test_tr = (_agent_field(test_agent, "tool_results") or {}) if test_agent else {}
+    tests_failed = int(test_tr.get("failed", 0))
 
     blocking_reasons: list[str] = []
     for f in findings:
-        sev = f.get("severity", "Low")
+        sev = str(f.get("severity") or "Low").title()
+        f["severity"] = sev
         verified = f.get("verification_status") == "Verified"
         is_block = verified and ((sev == "Critical" and block_critical) or (sev == "High" and block_high))
         f["is_blocking"] = is_block
         if is_block:
             blocking_reasons.append(f"{sev}: {f.get('title')} ({f.get('file_path')}:{f.get('line_number') or 1})")
 
+    # Priority 1: Stop Operation or mandatory agent/scanner timeout, failure, or missing API key
+    if is_review_cancelled(state.review_id) or stopped_agents:
+        return (
+            "Incomplete",
+            "Stopped by user before completion.",
+            findings,
+        )
     if require_all_scans and incomplete_agents:
         return (
             "Incomplete",
             f"Mandatory analysis incomplete for: {', '.join(incomplete_agents)}.",
             findings,
         )
+    # Priority 2: Mandatory test suite failure
     if require_tests_pass and tests_failed > 0:
         return (
             "Request Changes",
             f"Mandatory test suite failed ({tests_failed} failing test(s)) and {len(blocking_reasons)} blocking finding(s).",
             findings,
         )
+    # Priority 3: Verified Critical / High blocking finding
     if blocking_reasons:
         return (
             "Request Changes",
             f"{len(blocking_reasons)} verified blocking finding(s) found (top: {blocking_reasons[0]}).",
             findings,
         )
+    # Priority 4: Clean pass
     return (
         "Approve",
         "No verified Critical/High blocking findings and all mandatory checks passed.",
@@ -394,6 +429,33 @@ class ReviewerManagerExecutor(Executor):
                                     "rule_id": item.get("rule_id"),
                                 }
                             )
+            if res.agent_name == "test_coverage_agent" and int(tr.get("failed") or 0) > 0:
+                failed_cnt = int(tr.get("failed") or 0)
+                runner_name = str(tr.get("runner") or "pytest")
+                test_file_hint = str((tr.get("test_files") or [""])[0] or "")
+                has_test_failure = any(
+                    str(f.get("tool_name") or "") in ("pytest", "vitest")
+                    and "fail" in f"{f.get('title', '')} {f.get('description', '')}".lower()
+                    for f in all_raw_findings
+                )
+                if not has_test_failure:
+                    all_raw_findings.append(
+                        {
+                            "agent": "Test-Coverage Agent",
+                            "category": "testing",
+                            "severity": "High",
+                            "title": f"{runner_name} suite reported {failed_cnt} failing test(s)",
+                            "description": f"Deterministic {runner_name} execution failed with {failed_cnt} failing test(s).",
+                            "file_path": test_file_hint,
+                            "line_number": 1 if test_file_hint else None,
+                            "end_line": None,
+                            "evidence": str(tr.get("output") or "")[-400:],
+                            "recommendation": "Fix the failing unit/integration tests before merging.",
+                            "verification_status": "Verified",
+                            "tool_name": runner_name,
+                            "rule_id": "TEST-SUITE-FAILED",
+                        }
+                    )
 
         det_index, extras = _collect_deterministic_index(results)
         rejected_auto: list[dict[str, Any]] = []
@@ -544,6 +606,7 @@ class ReviewerManagerExecutor(Executor):
             consolidated = _deterministic_deduplicate(verified_raw)
             manager_summary = "Reviewer Manager LLM API key is missing; deterministic consolidation applied."
         except Exception as exc:
+            logger.exception("Reviewer Manager LLM failed")
             manager_status = "failed"
             manager_error = str(exc)
             consolidated = _deterministic_deduplicate(verified_raw)

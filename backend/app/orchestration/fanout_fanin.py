@@ -69,7 +69,7 @@ def build_review_workflow(
 
     return (
         WorkflowBuilder(
-            name="ReviewBoard-MultiAgent-Review",
+            name="Swarm-MultiAgent-Review",
             description="Six-agent Fan-out / Fan-in automated code review workflow",
             start_executor=dispatcher,
         )

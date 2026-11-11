@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 from typing import Any
 
 from agent_framework.openai import OpenAIChatCompletionClient
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, OpenAIError
 
 from app.orchestration.cancellation import (
     ReviewCancelledError,
@@ -17,6 +18,8 @@ from app.orchestration.cancellation import (
     unregister_http_client,
 )
 from app.orchestration.shared_state import AgentExecutionConfig
+
+logger = logging.getLogger(__name__)
 
 
 class MissingAPIKeyError(RuntimeError):
@@ -151,12 +154,12 @@ async def run_structured_agent(
         unregister_http_client(rid, sdk_client)
         try:
             await client.close()
-        except Exception:
-            pass
+        except (OSError, RuntimeError, OpenAIError) as exc:
+            logger.debug("Ignoring client close error: %s", exc)
         try:
             await sdk_client.close()
-        except Exception:
-            pass
+        except (OSError, RuntimeError, OpenAIError) as exc:
+            logger.debug("Ignoring SDK client close error: %s", exc)
 
 
 async def test_agent_connection(cfg: AgentExecutionConfig) -> dict[str, Any]:
@@ -196,7 +199,7 @@ async def test_agent_connection(cfg: AgentExecutionConfig) -> dict[str, Any]:
             "latency_ms": latency,
             "message": f"Connected cleanly ({resp.text.strip()[:40] or 'OK'})",
         }
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — connectivity probe surfaces exact SDK/network error
         latency = int((time.perf_counter() - t0) * 1000)
         return {
             "ok": False,

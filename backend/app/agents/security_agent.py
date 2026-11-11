@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -18,7 +19,9 @@ from app.orchestration.shared_state import (
 from app.scanners.code_engines import read_prioritized_workspace_files
 from app.scanners.security_tools import run_security_scanners
 
-SYSTEM_PROMPT = """You are the Security Agent in ReviewBoard, an automated multi-agent code review system.
+logger = logging.getLogger(__name__)
+
+SYSTEM_PROMPT = """You are the Security Agent in Swarm, an automated multi-agent code review system.
 You receive deterministic scan findings from Semgrep, Bandit, Gitleaks, OSV-Scanner, and Deterministic Security Guards along with line-numbered changed source files and diff.
 Your job:
 1. Interpret deterministic scanner hits and verify whether they represent real security vulnerabilities (if Gitleaks marks a hit with `is_test_fixture: true` in a unit test file with fake fixture values, keep it Low informational or note it is a benign test fixture rather than calling it a leaked production key).
@@ -194,6 +197,7 @@ class SecurityAgentExecutor(Executor):
             )
             await ctx.send_message(out)
         except Exception as exc:
+            logger.exception("Security Agent failed")
             duration_ms = int((time.perf_counter() - t0) * 1000)
             out = AgentExecutionOutput(
                 agent_name="security_agent",
@@ -201,6 +205,7 @@ class SecurityAgentExecutor(Executor):
                 model_used=cfg.model,
                 status="failed",
                 summary="Security Agent failed.",
+                tool_results=sec_res,
                 error_message=str(exc),
                 duration_ms=duration_ms,
             )

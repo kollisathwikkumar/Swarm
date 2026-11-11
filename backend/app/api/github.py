@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -21,7 +21,11 @@ from app.models.tables import (
     ReviewArtifact,
     User,
 )
-from app.orchestration.coordinator import launch_review_job
+from app.orchestration.coordinator import (
+    launch_review_job,
+    load_effective_agent_configs,
+    seed_agent_runs,
+)
 from app.scanners.git_diff_tool import parse_unified_diff
 from app.scanners.tool_runner import resolve_binary, run_command_capture
 from app.services.crypto import encrypt_secret
@@ -422,7 +426,7 @@ async def sync_github_repository(
         )
     ).scalar_one_or_none()
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     if existing:
         existing.default_branch = r.get("default_branch", "main")
         existing.description = r.get("description")
@@ -719,7 +723,9 @@ async def publish_review_to_github(
             )
         )
     ).scalar_one_or_none()
-    body = payload.custom_body or (artifact.content if artifact else f"ReviewBoard Recommendation: **{rev.recommendation}**\n\n{rev.recommendation_reason}")
+    body = payload.custom_body or (
+        artifact.content if artifact else f"Swarm Recommendation: **{rev.recommendation}**\n\n{rev.recommendation_reason}"
+    )
 
     published_info: dict = {}
     if cc.pr_number:
@@ -766,7 +772,7 @@ async def publish_review_to_github(
                 comments=inline_comments or None,
             )
             rev.github_review_id = pr_review.get("id")
-            rev.github_published_at = datetime.now(timezone.utc)
+            rev.github_published_at = datetime.now(UTC)
             published_info["pr_review_id"] = pr_review.get("id")
             published_info["pr_review_url"] = pr_review.get("html_url")
             published_info["inline_comments_posted"] = len(inline_comments)
@@ -787,7 +793,7 @@ async def publish_review_to_github(
                 repo.name,
                 rev.target_commit,
                 state=gh_state,
-                description=f"ReviewBoard: {rev.recommendation} — {rev.recommendation_reason[:90]}",
+                description=f"Swarm: {rev.recommendation} — {rev.recommendation_reason[:90]}",
             )
             published_info["commit_status_id"] = st.get("id")
         except GitHubAPIError as exc:
@@ -839,6 +845,8 @@ async def github_webhook(
         pr = payload["pull_request"]
         pr_number = int(pr["number"])
         diff_text, _files = await gh.get_pull_request_diff(repo.owner, repo.name, pr_number)
+        if not diff_text.strip():
+            return {"ignored": True, "reason": "Empty Pull Request diff"}
         parsed = parse_unified_diff(diff_text)
         base_sha = pr["base"]["sha"]
         head_sha = pr["head"]["sha"]
@@ -867,6 +875,9 @@ async def github_webhook(
             recommendation="Pending",
         )
         db.add(rev)
+        await db.flush()
+        configs = await load_effective_agent_configs(db)
+        await seed_agent_runs(db, rev.id, configs)
         await db.commit()
         launch_review_job(rev.id)
         return {"triggered": True, "review_id": rev.id, "pr_number": pr_number}
@@ -878,6 +889,8 @@ async def github_webhook(
             return {"ignored": True, "reason": "Branch deletion or empty push"}
         cmp_data = await gh.compare_commits(repo.owner, repo.name, before, after)
         diff_text = cmp_data.get("diff_text", "")
+        if not diff_text.strip():
+            return {"ignored": True, "reason": "Empty push diff"}
         parsed = parse_unified_diff(diff_text)
         branch = str(payload.get("ref", "")).replace("refs/heads/", "")
         cc = CodeChange(
@@ -902,6 +915,9 @@ async def github_webhook(
             recommendation="Pending",
         )
         db.add(rev)
+        await db.flush()
+        configs = await load_effective_agent_configs(db)
+        await seed_agent_runs(db, rev.id, configs)
         await db.commit()
         launch_review_job(rev.id)
         return {"triggered": True, "review_id": rev.id, "branch": branch}

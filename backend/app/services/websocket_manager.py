@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import WebSocket
+from fastapi import WebSocket, WebSocketDisconnect
 
 
 class WebSocketManager:
@@ -40,7 +40,7 @@ class WebSocketManager:
         message = {
             "review_id": review_id,
             "event_type": event_type,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             **payload,
         }
         async with self._lock:
@@ -51,7 +51,7 @@ class WebSocketManager:
         for ws in targets:
             try:
                 await ws.send_json(message)
-            except Exception:
+            except (WebSocketDisconnect, RuntimeError, OSError):
                 stale.append(ws)
         if stale:
             async with self._lock:

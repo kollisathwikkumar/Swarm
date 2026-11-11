@@ -143,19 +143,31 @@ export default function ArchitectureGuidePage() {
 
       {/* Deterministic Decision Rules */}
       <section className="rounded-xl border border-border bg-card p-5">
-        <h2 className="mb-3 text-base font-semibold">Final Recommendation Rules</h2>
+        <h2 className="mb-3 text-base font-semibold">Deterministic Decision Policy Matrix</h2>
         <ul className="space-y-2 text-xs">
           <li className="flex items-center justify-between gap-4 border-b border-border/60 py-2">
-            <span>Missing API key or failed mandatory scanner/agent</span>
-            <strong className="font-mono text-amber-600 dark:text-amber-400">Incomplete</strong>
+            <span>
+              <strong>Priority 1:</strong> User clicked Stop Operation, or a mandatory agent/scanner timed out, failed, or lacked an API key
+            </span>
+            <strong className="shrink-0 font-mono text-amber-600 dark:text-amber-400">Incomplete</strong>
           </li>
           <li className="flex items-center justify-between gap-4 border-b border-border/60 py-2">
-            <span>Any failing unit test (`failed &gt; 0`) or Verified Critical/High finding</span>
-            <strong className="font-mono text-rose-600 dark:text-rose-400">Request Changes</strong>
+            <span>
+              <strong>Priority 2:</strong> <code>require_tests_pass</code> is enabled and test execution reported <code>failed &gt; 0</code>
+            </span>
+            <strong className="shrink-0 font-mono text-rose-600 dark:text-rose-400">Request Changes</strong>
+          </li>
+          <li className="flex items-center justify-between gap-4 border-b border-border/60 py-2">
+            <span>
+              <strong>Priority 3:</strong> At least one Verified <code>Critical</code> (<code>block_on_critical=true</code>) or <code>High</code> (<code>block_on_high=true</code>) finding exists
+            </span>
+            <strong className="shrink-0 font-mono text-rose-600 dark:text-rose-400">Request Changes</strong>
           </li>
           <li className="flex items-center justify-between gap-4 py-2">
-            <span>All mandatory checks complete cleanly with zero verified blockers</span>
-            <strong className="font-mono text-emerald-600 dark:text-emerald-400">Approve</strong>
+            <span>
+              <strong>Priority 4:</strong> All mandatory checks completed cleanly with zero verified blockers
+            </span>
+            <strong className="shrink-0 font-mono text-emerald-600 dark:text-emerald-400">Approve</strong>
           </li>
         </ul>
       </section>

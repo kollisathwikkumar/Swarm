@@ -48,6 +48,7 @@ export default function RepositoriesPage() {
   const [repos, setRepos] = useState<RepositoryItem[]>([]);
   const [accounts, setAccounts] = useState<GitHubAccount[]>([]);
   const [envTokenConfigured, setEnvTokenConfigured] = useState(false);
+  const [oauthUrl, setOauthUrl] = useState<string | null>(null);
   const [ghCliStatus, setGhCliStatus] = useState<{ installed: boolean; authenticated: boolean } | null>(null);
   const [remoteRepos, setRemoteRepos] = useState<RemoteGitHubRepo[]>([]);
   const [companionOnline, setCompanionOnline] = useState<boolean | null>(null);
@@ -72,17 +73,19 @@ export default function RepositoriesPage() {
   const loadAll = useCallback(async () => {
     setLoading(true);
     try {
-      const [repoRes, acctRes, compRes, ghCliRes] = await Promise.all([
+      const [repoRes, acctRes, compRes, ghCliRes, oauthRes] = await Promise.all([
         apiFetch<{ repositories: RepositoryItem[] }>("/api/repositories"),
         apiFetch<{ accounts: GitHubAccount[]; env_token_configured: boolean }>("/api/github/accounts"),
         apiFetch<{ online: boolean }>("/api/repositories/companion/status"),
         apiFetch<{ installed: boolean; authenticated: boolean }>("/api/github/gh-cli/status"),
+        apiFetch<{ configured: boolean; url: string | null }>("/api/github/oauth/url"),
       ]);
       setRepos(repoRes.repositories);
       setAccounts(acctRes.accounts);
       setEnvTokenConfigured(acctRes.env_token_configured);
       setCompanionOnline(compRes.online);
       setGhCliStatus(ghCliRes);
+      setOauthUrl(oauthRes.configured ? oauthRes.url : null);
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "Failed loading repositories");
     } finally {
@@ -260,6 +263,42 @@ export default function RepositoriesPage() {
     }
   };
 
+  const handleDisconnectAccount = async (account: GitHubAccount) => {
+    setBusy(true);
+    setErrorMsg("");
+    setStatusMsg("");
+    try {
+      await apiFetch(`/api/github/accounts/${account.id}`, { method: "DELETE" });
+      setStatusMsg(`Disconnected GitHub account @${account.username}.`);
+      await loadAll();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "Failed disconnecting GitHub account");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleToggleAutoSync = async (repo: RepositoryItem) => {
+    setBusy(true);
+    setErrorMsg("");
+    setStatusMsg("");
+    try {
+      const next = !repo.auto_review_webhooks;
+      await apiFetch(`/api/repositories/${repo.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ auto_review_webhooks: next }),
+      });
+      setStatusMsg(
+        `Background PR auto-sync ${next ? "enabled" : "paused"} for ${repo.full_name}.`
+      );
+      await loadAll();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "Failed updating repository auto-sync");
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
       <header className="flex flex-wrap items-center justify-between gap-4 border-b border-border pb-4">
@@ -285,6 +324,15 @@ export default function RepositoriesPage() {
             <Github className="h-4 w-4" aria-hidden="true" />
             Connect Token
           </button>
+          {oauthUrl && (
+            <a
+              href={oauthUrl}
+              className="inline-flex min-h-10 items-center gap-2 rounded-lg border border-border bg-card px-3.5 py-2 text-xs font-medium hover:border-foreground/40"
+            >
+              <Github className="h-4 w-4" aria-hidden="true" />
+              Connect GitHub OAuth
+            </a>
+          )}
           <button
             type="button"
             onClick={handleBrowseRemoteRepos}
@@ -330,12 +378,22 @@ export default function RepositoriesPage() {
           {accounts.length > 0 ? (
             <ul className="mt-3 space-y-2">
               {accounts.map((a) => (
-                <li key={a.id} className="flex items-center justify-between font-mono text-xs">
+                <li key={a.id} className="flex flex-wrap items-center justify-between gap-2 font-mono text-xs">
                   <span className="flex items-center gap-2 font-medium">
                     <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" aria-hidden="true" />
                     @{a.username} ({a.auth_mode.toUpperCase()})
                   </span>
-                  <span className="text-muted-foreground">{a.scopes || "repo"}</span>
+                  <div className="flex items-center gap-3">
+                    <span className="text-muted-foreground">{a.scopes || "repo"}</span>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => void handleDisconnectAccount(a)}
+                      className="text-[11px] font-medium text-rose-600 hover:underline disabled:opacity-50 dark:text-rose-400"
+                    >
+                      Disconnect
+                    </button>
+                  </div>
                 </li>
               ))}
             </ul>
@@ -491,6 +549,10 @@ export default function RepositoriesPage() {
                             onSelect: () => void handleSyncOpenPRs(repo),
                           },
                           {
+                            label: repo.auto_review_webhooks ? "Pause Auto-Sync PRs" : "Enable Auto-Sync PRs",
+                            onSelect: () => void handleToggleAutoSync(repo),
+                          },
+                          {
                             label: "Configure Webhook…",
                             onSelect: () => {
                               setWebhookRepo(repo);
@@ -600,6 +662,14 @@ export default function RepositoriesPage() {
                               >
                                 <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
                                 Sync PRs
+                              </button>
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => handleToggleAutoSync(repo)}
+                                className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground hover:underline"
+                              >
+                                Auto-Sync: {repo.auto_review_webhooks ? "On" : "Off"}
                               </button>
                               <button
                                 type="button"

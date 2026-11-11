@@ -64,7 +64,7 @@ def _analyze_code_style_and_duplicates(
             for i, ln in enumerate(lines)
             if ln.strip() and not ln.strip().startswith(("#", "//", "/*"))
         ]
-        for i in range(0, max(0, len(normalized) - 5)):
+        for i in range(max(0, len(normalized) - 5)):
             window = "\n".join(x[1] for x in normalized[i : i + 6])
             if len(window) < 90:
                 continue
@@ -148,7 +148,7 @@ def _analyze_code_style_and_duplicates(
                     )
 
     duplicates: list[dict[str, Any]] = []
-    for _, occurrences in block_hashes.items():
+    for occurrences in block_hashes.values():
         if len(occurrences) > 1:
             first, second = occurrences[0], occurrences[1]
             duplicates.append(
@@ -192,14 +192,17 @@ async def run_style_scanners(
             cwd=workspace_dir,
             timeout=60,
         )
-        if res["stdout"].strip():
+        if res["timed_out"]:
+            ruff_status = "incomplete"
+            ruff_error = "ruff scan timed out"
+        elif res["stdout"].strip():
             try:
                 raw_items = json.loads(res["stdout"])
                 for item in raw_items:
                     fname = item.get("filename", "")
                     try:
                         rel_path = str(Path(fname).resolve().relative_to(workspace_dir.resolve()))
-                    except Exception:
+                    except ValueError:
                         rel_path = fname
                     loc = item.get("location") or {}
                     code = item.get("code") or "RUFF"
@@ -227,6 +230,7 @@ async def run_style_scanners(
         ruff_status = "skipped_no_python_files"
     elif not ruff_bin:
         ruff_status = "tool_unavailable"
+        ruff_error = "ruff binary not found"
 
     ast_res = _analyze_code_style_and_duplicates(workspace_dir, existing_targets)
 

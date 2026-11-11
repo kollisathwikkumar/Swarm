@@ -17,7 +17,7 @@ from repository_reader import inspect_repository, validate_repo_path
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ReviewBoard Local Review Companion CLI")
+    parser = argparse.ArgumentParser(description="Swarm Local Review Companion CLI")
     sub = parser.add_subparsers(dest="command", required=True)
 
     serve_p = sub.add_parser("serve", help="Run the Local Review Companion daemon on 127.0.0.1")
@@ -26,10 +26,10 @@ def main() -> None:
     insp_p = sub.add_parser("inspect", help="Inspect a local Git repository")
     insp_p.add_argument("path")
 
-    sub_p = sub.add_parser("submit", help="Extract local Git diff and submit to ReviewBoard backend")
+    sub_p = sub.add_parser("submit", help="Extract local Git diff and submit to Swarm backend")
     sub_p.add_argument("path")
     sub_p.add_argument("--backend", default="http://127.0.0.1:8000")
-    sub_p.add_argument("--token", default="", help="Optional ReviewBoard JWT Bearer token")
+    sub_p.add_argument("--token", default="", help="Optional Swarm JWT Bearer token")
     sub_p.add_argument("--mode", default="working_tree", choices=["working_tree", "staged", "unstaged", "commits"])
     sub_p.add_argument("--base", default="HEAD~1")
     sub_p.add_argument("--target", default="HEAD")
@@ -39,7 +39,7 @@ def main() -> None:
     if args.command == "serve":
         token, _ = pairing_manager.rotate()
         print("=" * 64)
-        print("ReviewBoard Local Review Companion running on http://127.0.0.1:" + str(args.port))
+        print("Swarm Local Review Companion running on http://127.0.0.1:" + str(args.port))
         print(f"Pairing Token (valid 30 min): {token}")
         print("=" * 64)
         uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="info")

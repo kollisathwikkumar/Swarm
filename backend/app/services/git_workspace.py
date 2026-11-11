@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import fnmatch
 import os
 import shutil
@@ -29,10 +30,7 @@ def is_excluded_path(rel_path: str, patterns: list[str] | None = None) -> bool:
         return True
     active = (patterns or []) + DEFAULT_SENSITIVE_EXCLUDES
     filename = Path(norm).name
-    for pat in active:
-        if fnmatch.fnmatch(norm, pat) or fnmatch.fnmatch(filename, pat):
-            return True
-    return False
+    return any(fnmatch.fnmatch(norm, pat) or fnmatch.fnmatch(filename, pat) for pat in active)
 
 
 def validate_git_ref(ref: str) -> str:
@@ -81,14 +79,10 @@ async def _run_git(
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.CancelledError:
-        try:
+        with contextlib.suppress(ProcessLookupError):
             proc.kill()
-        except ProcessLookupError:
-            pass
-        try:
+        with contextlib.suppress(ProcessLookupError, OSError):
             await proc.wait()
-        except Exception:
-            pass
         raise
     except TimeoutError:
         proc.kill()

@@ -1,18 +1,26 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+import logging
+from datetime import UTC, datetime
 from typing import Any
 
+import httpx
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import AGENT_METADATA
 from app.database.session import async_session_maker
-from app.integrations.github_client import GitHubClient
-from app.models.tables import AgentRun, CodeChange, Repository, Review
-from app.orchestration.coordinator import launch_review_job, load_effective_agent_configs
+from app.integrations.github_client import GitHubAPIError, GitHubClient
+from app.models.tables import CodeChange, Repository, Review
+from app.orchestration.coordinator import (
+    launch_review_job,
+    load_effective_agent_configs,
+    seed_agent_runs,
+)
 from app.scanners.git_diff_tool import parse_unified_diff
+
+logger = logging.getLogger(__name__)
 
 
 async def sync_repository_open_prs(
@@ -29,7 +37,7 @@ async def sync_repository_open_prs(
     """
     gh = GitHubClient(github_token)
     prs = await gh.list_pull_requests(repo.owner, repo.name, state="open")
-    repo.last_synced_at = datetime.now(timezone.utc)
+    repo.last_synced_at = datetime.now(UTC)
 
     triggered_reviews: list[str] = []
     skipped_existing = 0
@@ -95,16 +103,7 @@ async def sync_repository_open_prs(
             )
             db.add(rev)
             await db.flush()
-            for key, meta in AGENT_METADATA.items():
-                db.add(
-                    AgentRun(
-                        review_id=rev.id,
-                        agent_name=key,
-                        agent_label=meta["label"],
-                        model_used=configs[key].model,
-                        status="queued",
-                    )
-                )
+            await seed_agent_runs(db, rev.id, configs)
             await db.commit()
             launch_review_job(rev.id)
             triggered_reviews.append(rev.id)
@@ -143,9 +142,11 @@ async def github_background_poller(interval_seconds: int = 90) -> None:
                         await sync_repository_open_prs(
                             repo, token, db, auto_trigger_new_commits=True
                         )
-                    except Exception:
+                    except (GitHubAPIError, httpx.HTTPError, SQLAlchemyError) as exc:
+                        logger.debug("Background PR sync skipped for %s: %s", repo.full_name, exc)
                         continue
         except asyncio.CancelledError:
             break
-        except Exception:
+        except (OSError, RuntimeError, SQLAlchemyError) as exc:
+            logger.debug("Background PR poller cycle failed: %s", exc)
             continue

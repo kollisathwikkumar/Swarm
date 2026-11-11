@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from contextlib import asynccontextmanager, suppress
+from datetime import UTC, datetime
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,7 +25,7 @@ async def lifespan(_app: FastAPI):
             db.add(ReviewPolicy(name="default"))
 
         # Cleanly close any stale running/queued reviews interrupted by a prior restart
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         await db.execute(
             update(Review)
             .where(Review.review_status.in_(["queued", "running"]))
@@ -51,16 +51,14 @@ async def lifespan(_app: FastAPI):
         yield
     finally:
         poller_task.cancel()
-        try:
+        with suppress(asyncio.CancelledError):
             await poller_task
-        except asyncio.CancelledError:
-            pass
 
 
 app_settings = get_settings()
 
 app = FastAPI(
-    title="ReviewBoard — Automated Code Review Board API",
+    title="Swarm — Multi-Agent Automated Code Review API",
     version="1.0.0",
     description="Multi-agent AI code review platform powered by Microsoft Agent Framework and DeepSeek.",
     lifespan=lifespan,
@@ -86,7 +84,7 @@ app.include_router(settings.router)
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok", "service": "reviewboard-backend"}
+    return {"status": "ok", "service": "swarm-backend"}
 
 
 @app.websocket("/ws/reviews/{review_id}")

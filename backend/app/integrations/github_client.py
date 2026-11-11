@@ -48,7 +48,7 @@ def parse_github_repo_input(raw_input: str) -> dict[str, Any]:
         if len(parts) < 2:
             raise ValueError("URL must include owner and repository name (e.g. https://github.com/owner/repo)")
         owner = parts[0]
-        name = parts[1][:-4] if parts[1].endswith(".git") else parts[1]
+        name = parts[1].removesuffix(".git")
         pr_number = None
         commit_sha = None
         if len(parts) >= 4 and parts[2] == "pull" and parts[3].isdigit():
@@ -64,7 +64,7 @@ def parse_github_repo_input(raw_input: str) -> dict[str, Any]:
         }
 
     # Handle plain owner/repo
-    cleaned = text[:-4] if text.endswith(".git") else text
+    cleaned = text.removesuffix(".git")
     parts = [p for p in cleaned.strip("/").split("/") if p]
     if len(parts) != 2:
         raise ValueError("Enter owner/repo or a full https://github.com/owner/repo URL")
@@ -84,7 +84,7 @@ class GitHubClient:
         headers = {
             "Accept": accept,
             "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "ReviewBoard-MultiAgent/1.0",
+            "User-Agent": "Swarm-MultiAgent/1.0",
         }
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
@@ -113,7 +113,7 @@ class GitHubClient:
             try:
                 err_json = resp.json()
                 msg = err_json.get("message") or resp.text
-            except Exception:
+            except ValueError:
                 msg = resp.text
             raise GitHubAPIError(resp.status_code, msg)
         if raw_text:
@@ -314,7 +314,7 @@ class GitHubClient:
         state: str,
         description: str,
         target_url: str | None = None,
-        context: str = "ReviewBoard / Multi-Agent Review",
+        context: str = "Swarm / Multi-Agent Review",
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "state": state,
@@ -338,15 +338,19 @@ class GitHubClient:
         line: int,
         suggestion_code: str,
         explanation: str,
+        start_line: int | None = None,
     ) -> dict[str, Any]:
-        body = f"**ReviewBoard Fix Suggestion**\n\n{explanation}\n\n```suggestion\n{suggestion_code}\n```"
-        payload = {
+        body = f"**Swarm Fix Suggestion**\n\n{explanation}\n\n```suggestion\n{suggestion_code}\n```"
+        payload: dict[str, Any] = {
             "body": body,
             "commit_id": commit_id,
             "path": path,
             "line": line,
             "side": "RIGHT",
         }
+        if start_line is not None and start_line < line:
+            payload["start_line"] = start_line
+            payload["start_side"] = "RIGHT"
         return await self._request(
             "POST", f"/repos/{owner}/{repo}/pulls/{pr_number}/comments", json_body=payload
         )

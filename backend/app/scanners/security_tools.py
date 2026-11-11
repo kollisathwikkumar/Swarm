@@ -29,7 +29,7 @@ def _normalize_severity(raw: str | None) -> str:
 def _rel_path(workspace_dir: Path, raw_path: str) -> str:
     try:
         return str(Path(raw_path).resolve().relative_to(workspace_dir.resolve()))
-    except Exception:
+    except ValueError:
         return raw_path.lstrip("./")
 
 
@@ -43,8 +43,8 @@ def _read_source_snippet(workspace_dir: Path, rel_path: str, line_no: int | None
         lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
         if line_no <= len(lines):
             return lines[line_no - 1].strip()
-    except Exception:
-        pass
+    except OSError:
+        return ""
     return ""
 
 
@@ -63,6 +63,8 @@ async def run_bandit(workspace_dir: Path, targets: list[str]) -> dict[str, Any]:
         cmd.extend(["-r", "."])
 
     res = await run_command_capture(cmd, cwd=workspace_dir, timeout=90)
+    if res["timed_out"]:
+        return {"status": "incomplete", "findings": [], "error": "bandit scan timed out"}
     findings: list[dict[str, Any]] = []
     if res["stdout"].strip():
         try:
@@ -105,7 +107,7 @@ async def run_semgrep(workspace_dir: Path, targets: list[str]) -> dict[str, Any]
     existing = prioritize_repo_files(
         [t for t in targets if (workspace_dir / t).exists() and (workspace_dir / t).is_file()]
     )[:80]
-    scan_targets = existing if existing else ["."]
+    scan_targets = existing or ["."]
 
     cmd = [
         semgrep_bin,
@@ -118,6 +120,8 @@ async def run_semgrep(workspace_dir: Path, targets: list[str]) -> dict[str, Any]
         *scan_targets,
     ]
     res = await run_command_capture(cmd, cwd=workspace_dir, timeout=120)
+    if res["timed_out"]:
+        return {"status": "incomplete", "findings": [], "error": "semgrep scan timed out"}
 
     findings: list[dict[str, Any]] = []
     if res["stdout"].strip():
@@ -192,6 +196,8 @@ async def run_gitleaks(workspace_dir: Path) -> dict[str, Any]:
             "--redact",
         ]
         res = await run_command_capture(cmd, cwd=workspace_dir, timeout=60)
+        if res["timed_out"]:
+            return {"status": "incomplete", "findings": [], "error": "gitleaks scan timed out"}
         findings: list[dict[str, Any]] = []
         if report_path.exists() and report_path.stat().st_size > 0:
             raw = report_path.read_text(encoding="utf-8", errors="replace").strip()
@@ -258,6 +264,8 @@ async def run_osv_scanner(workspace_dir: Path) -> dict[str, Any]:
 
     cmd = [osv_bin, "scan", "--format", "json", "-r", str(workspace_dir)]
     res = await run_command_capture(cmd, cwd=workspace_dir, timeout=90)
+    if res["timed_out"]:
+        return {"status": "incomplete", "findings": [], "error": "osv-scanner scan timed out"}
     findings: list[dict[str, Any]] = []
     if res["stdout"].strip():
         try:

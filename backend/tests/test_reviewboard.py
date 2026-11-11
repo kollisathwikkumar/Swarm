@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
 import subprocess
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -13,6 +15,8 @@ BACKEND_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = BACKEND_ROOT.parent
 sys.path.insert(0, str(BACKEND_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "local-companion"))
+
+from repository_reader import is_sensitive_path, validate_repo_path
 
 from app.agents.fix_suggestion_agent import _compute_unified_diff
 from app.agents.reviewer_manager import (
@@ -35,7 +39,16 @@ from app.scanners.style_tools import run_style_scanners
 from app.scanners.test_tools import build_test_coverage_map, run_test_and_coverage
 from app.services.crypto import decrypt_secret, encrypt_secret, hash_password, verify_password
 from app.services.git_workspace import verify_patch_applicability
-from repository_reader import is_sensitive_path, validate_repo_path
+
+
+async def _arun_git(*args: str, cwd: Path) -> None:
+    await asyncio.to_thread(
+        subprocess.run,
+        ["git", *args],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+    )
 
 
 def test_password_and_secret_crypto():
@@ -69,7 +82,7 @@ index 1111111..2222222 100644
 @pytest.mark.asyncio
 async def test_real_security_style_and_test_scanners(tmp_path: Path):
     # Create a real mini git repo with real SQLi, secret, style issue, and failing/passing tests
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    await _arun_git("init", cwd=tmp_path)
     vuln_file = tmp_path / "login.py"
     vuln_file.write_text(
         'import sqlite3\n'
@@ -110,7 +123,7 @@ async def test_real_security_style_and_test_scanners(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_unified_diff_and_git_apply_check(tmp_path: Path):
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    await _arun_git("init", cwd=tmp_path)
     target = tmp_path / "app.py"
     original = "def add(a, b):\n    return a - b\n"
     proposed = "def add(a, b):\n    return a + b\n"
@@ -236,6 +249,7 @@ def test_local_companion_security_controls(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_api_end_to_end_zero_fake_data_and_missing_key_incomplete(tmp_path: Path, monkeypatch):
     import asyncio
+
     from httpx import ASGITransport, AsyncClient
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -276,13 +290,13 @@ async def test_api_end_to_end_zero_fake_data_and_missing_key_incomplete(tmp_path
     # Build a real local Git repo with an initial commit and an uncommitted vulnerable change
     repo_dir = tmp_path / "sample_repo"
     repo_dir.mkdir()
-    subprocess.run(["git", "init"], cwd=repo_dir, check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.email", "dev@example.com"], cwd=repo_dir, check=True)
-    subprocess.run(["git", "config", "user.name", "Dev"], cwd=repo_dir, check=True)
+    await _arun_git("init", cwd=repo_dir)
+    await _arun_git("config", "user.email", "dev@example.com", cwd=repo_dir)
+    await _arun_git("config", "user.name", "Dev", cwd=repo_dir)
     (repo_dir / "app.py").write_text("def greet(name: str) -> str:\n    return f'hi {name}'\n", encoding="utf-8")
     (repo_dir / "test_app.py").write_text("from app import greet\ndef test_greet():\n    assert greet('a') == 'hi a'\n", encoding="utf-8")
-    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
-    subprocess.run(["git", "commit", "-m", "init"], cwd=repo_dir, check=True, capture_output=True)
+    await _arun_git("add", ".", cwd=repo_dir)
+    await _arun_git("commit", "-m", "init", cwd=repo_dir)
 
     # Introduce a real SQL injection in working tree
     (repo_dir / "app.py").write_text(
@@ -440,6 +454,7 @@ async def test_accuracy_engines_syntax_guards_and_test_mapper(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_stop_review_cancellation_prevents_wasted_tokens(tmp_path: Path, monkeypatch):
     import asyncio
+
     from httpx import ASGITransport, AsyncClient
     from sqlalchemy import select
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -638,11 +653,13 @@ def test_audit_hardening_git_refs_paths_urls_and_patch_assembly(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_batch_commit_all_patches_to_github(tmp_path: Path, monkeypatch):
-    from datetime import datetime, timedelta, timezone
-
     from httpx import ASGITransport, AsyncClient
     from sqlalchemy import select
-    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+    from sqlalchemy.ext.asyncio import (
+        AsyncSession,
+        async_sessionmaker,
+        create_async_engine,
+    )
 
     from app.database.session import Base, get_db
     from app.integrations.github_client import GitHubClient
@@ -683,7 +700,7 @@ async def test_batch_commit_all_patches_to_github(tmp_path: Path, monkeypatch):
         async with test_engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
 
-        base_t = datetime.now(timezone.utc)
+        base_t = datetime.now(UTC)
         async with test_session_maker() as db:
             user = User(email="workspace@reviewboard.local", name="Dev", password_hash="x")
             db.add(user)
@@ -806,6 +823,178 @@ async def test_batch_commit_all_patches_to_github(tmp_path: Path, monkeypatch):
     finally:
         app.dependency_overrides.clear()
         await test_engine.dispose()
+
+
+def test_policy_matrix_six_agents_and_suggestion_hunk(tmp_path: Path):
+    from app.api.patches import _extract_suggestion_hunk
+
+    state = ReviewState(
+        review_id="r-matrix",
+        repository_id="repo-m",
+        repository_name="org/repo",
+        source_type="github",
+        base_commit="abc",
+        target_commit="def",
+        workspace_dir=tmp_path,
+        diff_text="",
+        changed_files=[],
+        policy={
+            "block_on_critical": True,
+            "block_on_high": True,
+            "require_tests_pass": True,
+            "require_all_mandatory_scans": True,
+        },
+        agent_configs={},
+    )
+    all_six_completed = [
+        {"agent_name": "diff_agent", "agent_label": "Diff Agent", "status": "completed", "tool_results": {}},
+        {"agent_name": "style_agent", "agent_label": "Style Agent", "status": "completed", "tool_results": {}},
+        {"agent_name": "security_agent", "agent_label": "Security Agent", "status": "completed", "tool_results": {}},
+        {
+            "agent_name": "test_coverage_agent",
+            "agent_label": "Test-Coverage Agent",
+            "status": "completed",
+            "tool_results": {"failed": 0},
+        },
+        {"agent_name": "reviewer_manager", "agent_label": "Reviewer Manager", "status": "completed", "tool_results": {}},
+        {
+            "agent_name": "fix_suggestion_agent",
+            "agent_label": "Fix-Suggestion Agent",
+            "status": "completed",
+            "tool_results": {},
+        },
+    ]
+
+    # Priority 4: All 6 completed cleanly, 0 blockers -> Approve
+    rec_ok, _, _ = _evaluate_review_policy(state, [], all_six_completed)
+    assert rec_ok == "Approve"
+
+    # Priority 1: Stage-6 Fix-Suggestion Agent incomplete/failed -> Incomplete
+    fix_failed = [*all_six_completed[:-1], {**all_six_completed[-1], "status": "incomplete"}]
+    rec_fix_inc, reason_fix_inc, _ = _evaluate_review_policy(state, [], fix_failed)
+    assert rec_fix_inc == "Incomplete"
+    assert "Fix-Suggestion Agent" in reason_fix_inc
+
+    # Priority 1: Stopped operation -> Incomplete regardless of findings
+    stopped = [{**all_six_completed[0], "status": "stopped"}, *all_six_completed[1:]]
+    rec_stop, reason_stop, _ = _evaluate_review_policy(state, [], stopped)
+    assert rec_stop == "Incomplete"
+    assert "Stopped by user" in reason_stop
+
+    # Priority 2: Test suite failed -> Request Changes
+    tests_failed = [
+        *all_six_completed[:3],
+        {**all_six_completed[3], "tool_results": {"failed": 2}},
+        *all_six_completed[4:],
+    ]
+    rec_tests, reason_tests, _ = _evaluate_review_policy(state, [], tests_failed)
+    assert rec_tests == "Request Changes"
+    assert "2 failing test" in reason_tests
+
+    # Bounded GitHub PR suggestion hunk replaces only changed lines instead of full file
+    orig = "line1\nconst re = /abc/def/;\nline3\nline4\n"
+    prop = "line1\nconst re = /abcdef/;\nline3\nline4\n"
+    start_l, end_l, snippet = _extract_suggestion_hunk(orig, prop, fallback_line=2)
+    assert start_l is None
+    assert end_l == 2
+    assert snippet == "const re = /abcdef/;"
+
+
+@pytest.mark.asyncio
+async def test_local_full_codebase_policy_clearing_and_repo_toggle(tmp_path: Path, monkeypatch):
+    from httpx import ASGITransport, AsyncClient
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+    import app.database.session as db_sess
+    import app.orchestration.coordinator as coord_mod
+    from app.config import get_settings
+    from app.database.session import Base, get_db
+    from app.main import app
+
+    db_file = tmp_path / "test_full_local.db"
+    test_engine = create_async_engine(f"sqlite+aiosqlite:///{db_file}", connect_args={"check_same_thread": False})
+    test_session_maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+
+    monkeypatch.setattr(db_sess, "engine", test_engine)
+    monkeypatch.setattr(db_sess, "async_session_maker", test_session_maker)
+    monkeypatch.setattr(coord_mod, "async_session_maker", test_session_maker)
+    monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path / "ws"))
+    get_settings.cache_clear()
+
+    async with test_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async def override_get_db():
+        async with test_session_maker() as s:
+            yield s
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    # Prevent background execution loop while still verifying seeded DB records
+    launched: list[str] = []
+    monkeypatch.setattr("app.api.reviews.launch_review_job", lambda rid: launched.append(rid))
+
+    repo_dir = tmp_path / "local_proj"
+    repo_dir.mkdir()
+    await _arun_git("init", cwd=repo_dir)
+    await _arun_git("config", "user.email", "dev@example.com", cwd=repo_dir)
+    await _arun_git("config", "user.name", "Dev", cwd=repo_dir)
+    (repo_dir / "main.py").write_text("def hello() -> str:\n    return 'ok'\n", encoding="utf-8")
+    await _arun_git("add", ".", cwd=repo_dir)
+    await _arun_git("commit", "-m", "initial", cwd=repo_dir)
+
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            # 1. Verify policy excluded_paths can be cleared to empty list cleanly
+            put_res = await client.put(
+                "/api/settings/policy",
+                json={
+                    "block_on_critical": True,
+                    "block_on_high": True,
+                    "require_tests_pass": True,
+                    "require_all_mandatory_scans": True,
+                    "enable_test_execution": True,
+                    "auto_publish_github_review": False,
+                    "excluded_paths": [],
+                },
+            )
+            assert put_res.status_code == 200
+            pol_res = await client.get("/api/settings/policy")
+            assert pol_res.json()["policy"]["excluded_paths"] == []
+
+            # 2. Register clean local repo and toggle auto_review_webhooks
+            conn_resp = await client.post(
+                "/api/repositories/local",
+                json={"local_path": str(repo_dir), "name": "local_proj"},
+            )
+            assert conn_resp.status_code == 200
+            repo_id = conn_resp.json()["repository"]["id"]
+
+            patch_res = await client.patch(
+                f"/api/repositories/{repo_id}",
+                json={"auto_review_webhooks": False},
+            )
+            assert patch_res.status_code == 200
+            assert patch_res.json()["repository"]["auto_review_webhooks"] is False
+
+            # 3. Full Codebase Audit on clean local repo succeeds even with zero dirty changes
+            sub_res = await client.post(
+                "/api/reviews",
+                json={"repository_id": repo_id, "full_codebase": True},
+            )
+            assert sub_res.status_code == 201
+            rev_id = sub_res.json()["review_id"]
+            assert launched == [rev_id]
+
+            detail = (await client.get(f"/api/reviews/{rev_id}")).json()
+            assert detail["code_change"]["source_mode"] == "local_full_repo"
+            assert "main.py" in detail["code_change"]["file_snapshots"]
+            assert len(detail["agent_runs"]) == 6
+    finally:
+        app.dependency_overrides.clear()
+        get_settings.cache_clear()
+        await test_engine.dispose()
+
 
 
 

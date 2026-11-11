@@ -241,15 +241,22 @@ async def run_test_and_coverage(
             passed = failed = skipped = 0
             m_pass = re.search(r"Tests\s+[^\n]*?(\d+)\s+passed", combined)
             m_fail = re.search(r"Tests\s+[^\n]*?(\d+)\s+failed", combined)
+            m_file_fail = re.search(r"Test Files\s+[^\n]*?(\d+)\s+failed", combined)
+            m_errors = re.search(r"Errors\s+(\d+)\s+error", combined)
             m_skip = re.search(r"Tests\s+[^\n]*?(\d+)\s+skipped", combined)
             if m_pass:
                 passed = int(m_pass.group(1))
-            if m_fail:
-                failed = int(m_fail.group(1))
+            failed_tests = int(m_fail.group(1)) if m_fail else 0
+            failed_files = int(m_file_fail.group(1)) if m_file_fail else 0
+            err_count = int(m_errors.group(1)) if m_errors else 0
+            failed = (failed_tests if failed_tests > 0 else failed_files) + err_count
             if m_skip:
                 skipped = int(m_skip.group(1))
+            if run_res["returncode"] not in (0, 124) and failed == 0:
+                failed = 1
             return {
                 "status": "incomplete" if run_res["returncode"] == 124 else "completed",
+                "error": "Vitest execution timed out" if run_res["returncode"] == 124 else None,
                 "runner": "vitest",
                 "returncode": run_res["returncode"],
                 "tests_found": len(js_tests),
@@ -356,8 +363,8 @@ async def run_test_and_coverage(
                     "covered_lines": len(info.get("executed_lines", [])),
                     "missing_lines": info.get("missing_lines", [])[:40],
                 }
-        except Exception:
-            pass
+        except (OSError, json.JSONDecodeError, ValueError):
+            file_coverage = {}
         finally:
             cov_json_path.unlink(missing_ok=True)
             (workspace_dir / ".coverage").unlink(missing_ok=True)
@@ -370,13 +377,17 @@ async def run_test_and_coverage(
 
     rc = run_res["returncode"]
     status = "completed"
-    if rc == 124:
+    err_msg: str | None = None
+    if rc == 124 or run_res.get("timed_out"):
         status = "incomplete"
+        err_msg = "pytest execution timed out"
     elif rc in (2, 3, 4) and passed == 0 and failed == 0:
         status = "incomplete"
+        err_msg = combined[-300:] or f"pytest exited with code {rc} during test collection/execution"
 
     return {
         "status": status,
+        "error": err_msg,
         "runner": "pytest",
         "returncode": rc,
         "tests_found": len(py_tests) + len(js_tests),

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -174,7 +174,7 @@ async def test_llm_agent(
             base_url=configs[agent_name].base_url,
         )
         db.add(row)
-    row.last_tested_at = datetime.now(timezone.utc)
+    row.last_tested_at = datetime.now(UTC)
     row.last_test_status = ("OK: " if res["ok"] else "ERROR: ") + res["message"][:180]
     await db.commit()
     return res
@@ -225,8 +225,7 @@ async def update_review_policy(
     policy.require_all_mandatory_scans = payload.require_all_mandatory_scans
     policy.enable_test_execution = payload.enable_test_execution
     policy.auto_publish_github_review = payload.auto_publish_github_review
-    if payload.excluded_paths:
-        policy.excluded_paths = payload.excluded_paths
+    policy.excluded_paths = [p.strip() for p in payload.excluded_paths if p.strip()]
     await db.commit()
     return {"updated": True}
 

@@ -3,15 +3,13 @@ from __future__ import annotations
 import hmac
 import secrets
 import time
-from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
+from diff_extractor import extract_diff
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
-
-from diff_extractor import extract_diff
 from repository_reader import inspect_repository, validate_repo_path
 
 
@@ -34,7 +32,7 @@ class PairingTokenManager:
 
 pairing_manager = PairingTokenManager()
 
-app = FastAPI(title="ReviewBoard Local Review Companion", version="1.0.0")
+app = FastAPI(title="Swarm Local Review Companion", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],

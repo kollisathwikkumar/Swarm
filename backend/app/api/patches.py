@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import difflib
+from datetime import UTC, datetime
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -15,6 +16,29 @@ from app.models.tables import CodeChange, Finding, PatchSuggestion, Repository, 
 from app.services.git_workspace import apply_patch_to_local_repo, is_excluded_path
 
 router = APIRouter(prefix="/api/patches", tags=["patches"])
+
+
+def _extract_suggestion_hunk(
+    original: str, proposed: str, fallback_line: int
+) -> tuple[int | None, int, str]:
+    """Compute a bounded GitHub PR suggestion replacement hunk instead of dumping the full file."""
+    orig_lines = original.splitlines()
+    prop_lines = proposed.splitlines()
+    matcher = difflib.SequenceMatcher(a=orig_lines, b=prop_lines)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        if tag == "insert":
+            anchor = max(1, i1)
+            prefix = [orig_lines[anchor - 1]] if orig_lines and i1 > 0 else []
+            suffix = [orig_lines[0]] if orig_lines and i1 == 0 else []
+            replacement = "\n".join(prefix + prop_lines[j1:j2] + suffix)
+            return None, anchor, replacement
+        start_line = i1 + 1
+        end_line = max(start_line, i2)
+        replacement = "\n".join(prop_lines[j1:j2])
+        return (start_line if end_line > start_line else None), end_line, replacement
+    return None, max(1, fallback_line), proposed
 
 
 class PatchDecisionRequest(BaseModel):
@@ -171,7 +195,7 @@ async def commit_all_patches_to_github(
         raise HTTPException(status_code=400, detail="No GitHub token connected")
     gh = GitHubClient(token)
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     committed: list[dict] = []
     skipped: list[dict] = []
     errors: list[dict] = []
@@ -265,7 +289,7 @@ async def decide_patch(
         raise HTTPException(status_code=404, detail="Patch suggestion not found")
 
     patch, rev, repo, cc = row
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     result_info: dict = {}
 
     if payload.action == "approve":
@@ -294,6 +318,9 @@ async def decide_patch(
             await db.execute(select(Finding).where(Finding.id == patch.finding_id))
         ).scalar_one_or_none()
         target_line = (finding.line_number if finding and finding.line_number else 1)
+        start_line, end_line, suggestion_snippet = _extract_suggestion_hunk(
+            patch.original_code, patch.proposed_code, target_line
+        )
         try:
             comment = await gh.create_pr_comment_suggestion(
                 repo.owner,
@@ -301,8 +328,9 @@ async def decide_patch(
                 cc.pr_number,
                 commit_id=rev.target_commit,
                 path=patch.file_path,
-                line=target_line,
-                suggestion_code=patch.proposed_code,
+                line=end_line,
+                start_line=start_line,
+                suggestion_code=suggestion_snippet,
                 explanation=patch.explanation,
             )
             patch.approval_status = "approved"

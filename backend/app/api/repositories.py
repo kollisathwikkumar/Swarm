@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import logging
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
+from git import GitCommandError, InvalidGitRepositoryError
 from git import Repo as GitRepo
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
@@ -15,7 +17,11 @@ from app.config import get_settings
 from app.database.session import get_db
 from app.integrations.github_client import GitHubAPIError, GitHubClient, parse_github_repo_input
 from app.models.tables import CodeChange, Repository, Review, User
-from app.orchestration.coordinator import launch_review_job
+from app.orchestration.coordinator import (
+    launch_review_job,
+    load_effective_agent_configs,
+    seed_agent_runs,
+)
 from app.scanners.git_diff_tool import parse_unified_diff
 from app.services.git_workspace import (
     ensure_github_mirror,
@@ -24,12 +30,18 @@ from app.services.git_workspace import (
     validate_git_ref,
 )
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/repositories", tags=["repositories"])
 
 
 class ConnectLocalRepoRequest(BaseModel):
     local_path: str = Field(min_length=1, max_length=1000)
     name: str | None = None
+
+
+class UpdateRepositoryRequest(BaseModel):
+    auto_review_webhooks: bool | None = None
+    default_branch: str | None = None
 
 
 class CompanionSubmitRequest(BaseModel):
@@ -92,8 +104,8 @@ def _extract_local_git_diff(repo_path: Path, mode: str, base_ref: str = "HEAD~1"
             else:
                 try:
                     snapshots[parsed.path] = git_repo.git.show(f"{target_commit}:{parsed.path}")
-                except Exception:
-                    pass
+                except GitCommandError as exc:
+                    logger.debug("Skipping snapshot for %s at %s: %s", parsed.path, target_commit, exc)
 
     return base_commit, target_commit, diff_text, snapshots
 
@@ -154,7 +166,7 @@ async def connect_local_repository(
     git_repo = GitRepo(str(resolved))
     try:
         active_branch = git_repo.active_branch.name
-    except Exception:
+    except TypeError:
         active_branch = "HEAD"
 
     name = (payload.name or resolved.name).strip()
@@ -169,7 +181,7 @@ async def connect_local_repository(
         )
     ).scalar_one_or_none()
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     if existing:
         existing.default_branch = active_branch
         existing.last_synced_at = now
@@ -196,8 +208,8 @@ async def connect_local_repository(
             origin_url = git_repo.remotes.origin.url
             if "github.com" in origin_url.lower():
                 detected_github_repo = parse_github_repo_input(origin_url)["full_name"]
-    except Exception:
-        pass
+    except (AttributeError, IndexError, ValueError) as exc:
+        logger.debug("No parseable GitHub origin remote at %s: %s", resolved, exc)
 
     return {
         "repository": {
@@ -208,6 +220,37 @@ async def connect_local_repository(
             "local_path": repo.local_path,
         },
         "detected_github_repo": detected_github_repo,
+    }
+
+
+@router.patch("/{repo_id}")
+async def update_repository(
+    repo_id: str,
+    payload: UpdateRepositoryRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    repo = (
+        await db.execute(
+            select(Repository).where(Repository.id == repo_id, Repository.user_id == user.id)
+        )
+    ).scalar_one_or_none()
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repository not found")
+    if payload.auto_review_webhooks is not None:
+        repo.auto_review_webhooks = payload.auto_review_webhooks
+    if payload.default_branch is not None and payload.default_branch.strip():
+        try:
+            repo.default_branch = validate_git_ref(payload.default_branch)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await db.commit()
+    return {
+        "repository": {
+            "id": repo.id,
+            "auto_review_webhooks": repo.auto_review_webhooks,
+            "default_branch": repo.default_branch,
+        }
     }
 
 
@@ -285,7 +328,7 @@ async def check_local_companion_status(user: User = Depends(get_current_user)) -
         async with httpx.AsyncClient(timeout=3.0) as client:
             resp = await client.get(f"{url}/health")
         return {"online": resp.status_code == 200, "url": url, "details": resp.json() if resp.status_code == 200 else {}}
-    except Exception as exc:
+    except (httpx.HTTPError, ValueError) as exc:
         return {"online": False, "url": url, "error": str(exc)}
 
 
@@ -315,7 +358,7 @@ async def submit_from_local_companion(
             description=f"Local companion repository at {resolved}",
             default_branch=payload.base_branch,
             local_path=resolved,
-            last_synced_at=datetime.now(timezone.utc),
+            last_synced_at=datetime.now(UTC),
         )
         db.add(repo)
         await db.flush()
@@ -348,6 +391,9 @@ async def submit_from_local_companion(
         recommendation="Pending",
     )
     db.add(rev)
+    await db.flush()
+    configs = await load_effective_agent_configs(db)
+    await seed_agent_runs(db, rev.id, configs)
     await db.commit()
     launch_review_job(rev.id)
     return {"review_id": rev.id, "repository_id": repo.id, "status": "queued"}
@@ -404,11 +450,11 @@ async def get_repository_tree(
                     ref=target_ref,
                     github_token=token,
                 )
-            except Exception as m_exc:
+            except (RuntimeError, OSError, GitCommandError, InvalidGitRepositoryError, ValueError) as m_exc:
                 raise HTTPException(
                     status_code=exc.status_code,
                     detail=f"GitHub tree error: {exc.message} (Mirror fallback failed: {m_exc})",
-                )
+                ) from m_exc
             git_mirror = GitRepo(str(mirror_dir))
             branches = [
                 r_ref.name.replace("origin/", "")
@@ -560,7 +606,7 @@ async def get_repository_file_content(
                 )
                 content = git_mirror.git.show(f"{show_ref}:{clean_path}")
                 sha = ""
-            except Exception:
+            except (RuntimeError, OSError, GitCommandError, InvalidGitRepositoryError, ValueError):
                 raise HTTPException(status_code=exc.status_code, detail=f"GitHub file error: {exc.message}")
         is_binary = "\x00" in content[:4096]
         return {
@@ -586,7 +632,7 @@ async def get_repository_file_content(
         git_repo = GitRepo(str(repo_path))
         try:
             content = git_repo.git.show(f"{target_ref}:{clean_path}")
-        except Exception as exc:
+        except (GitCommandError, InvalidGitRepositoryError) as exc:
             raise HTTPException(status_code=404, detail=f"File not found at {target_ref}: {exc}")
         is_binary = "\x00" in content[:4096]
         return {

@@ -17,6 +17,7 @@ function SettingsContent() {
   const { pref, resolved, setPref } = useResolvedTheme();
   const [agents, setAgents] = useState<AgentLLMConfigItem[]>([]);
   const [policy, setPolicy] = useState<ReviewPolicyData | null>(null);
+  const [excludedPathsText, setExcludedPathsText] = useState("");
   const [scanners, setScanners] = useState<Record<string, ScannerStatusItem>>({});
   const [drafts, setDrafts] = useState<
     Record<string, { model: string; base_url: string; api_key: string; temperature: string }>
@@ -38,6 +39,7 @@ function SettingsContent() {
       ]);
       setAgents(llmRes.agents);
       setPolicy(polRes.policy);
+      setExcludedPathsText((polRes.policy.excluded_paths || []).join("\n"));
       setScanners(scanRes.scanners);
       const nextDrafts: Record<string, { model: string; base_url: string; api_key: string; temperature: string }> = {};
       for (const a of llmRes.agents) {
@@ -102,6 +104,31 @@ function SettingsContent() {
     }
   };
 
+  const clearAgentKey = async (agentName: string) => {
+    const d = drafts[agentName];
+    if (!d) return;
+    setBusyKey(`clear:${agentName}`);
+    setError("");
+    setNotice("");
+    try {
+      await apiFetch(`/api/settings/llm-agents/${agentName}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          model: d.model,
+          base_url: d.base_url,
+          clear_api_key: true,
+          temperature: d.temperature,
+        }),
+      });
+      setNotice(`Cleared stored API key for ${agentName}.`);
+      await loadAll();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed clearing API key");
+    } finally {
+      setBusyKey("");
+    }
+  };
+
   const testAgent = async (agentName: string) => {
     setBusyKey(`test:${agentName}`);
     setError("");
@@ -158,11 +185,20 @@ function SettingsContent() {
     setBusyKey("policy");
     setError("");
     setNotice("");
+    const parsedExcluded = excludedPathsText
+      .split(/[\n,]/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const updatedPolicy: ReviewPolicyData = {
+      ...policy,
+      excluded_paths: parsedExcluded,
+    };
     try {
       await apiFetch("/api/settings/policy", {
         method: "PUT",
-        body: JSON.stringify(policy),
+        body: JSON.stringify(updatedPolicy),
       });
+      setPolicy(updatedPolicy);
       setNotice("Saved review policy rules.");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed saving policy");
@@ -348,6 +384,16 @@ function SettingsContent() {
                   )}
 
                   <div className="flex flex-wrap justify-end gap-2">
+                    {agent.key_source === "database" && (
+                      <button
+                        type="button"
+                        disabled={busyKey === `clear:${agent.agent_name}`}
+                        onClick={() => clearAgentKey(agent.agent_name)}
+                        className="inline-flex min-h-9 items-center gap-1.5 rounded-lg border border-rose-500/35 px-3 py-1.5 text-xs font-medium text-rose-700 hover:bg-rose-500/10 disabled:opacity-50 dark:text-rose-300"
+                      >
+                        {busyKey === `clear:${agent.agent_name}` ? "Clearing..." : "Clear Key"}
+                      </button>
+                    )}
                     <button
                       type="button"
                       disabled={busyKey === `test:${agent.agent_name}`}
@@ -415,6 +461,20 @@ function SettingsContent() {
                   </div>
                 );
               })}
+
+              <div className="space-y-1.5 pt-2">
+                <label htmlFor="pol-excluded-paths" className="block font-mono text-[11px] uppercase tracking-wider text-muted-foreground">
+                  Excluded Paths (one glob pattern per line)
+                </label>
+                <textarea
+                  id="pol-excluded-paths"
+                  rows={4}
+                  spellCheck={false}
+                  value={excludedPathsText}
+                  onChange={(e) => setExcludedPathsText(e.target.value)}
+                  className="w-full rounded-lg border border-border bg-muted px-3 py-2 font-mono text-xs"
+                />
+              </div>
 
               <button
                 type="submit"

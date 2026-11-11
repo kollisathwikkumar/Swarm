@@ -38,10 +38,10 @@ function SubmitReviewContent() {
 
   const [repos, setRepos] = useState<RepositoryItem[]>([]);
   const [selectedRepoId, setSelectedRepoId] = useState(preselectedRepo);
-  const [githubMode, setGithubMode] = useState<"pr" | "commit" | "compare">(
+  const [githubMode, setGithubMode] = useState<"pr" | "commit" | "compare" | "full">(
     preselectedCommit ? "commit" : "pr"
   );
-  const [localMode, setLocalMode] = useState<"working_tree" | "staged" | "unstaged" | "commits">(
+  const [localMode, setLocalMode] = useState<"working_tree" | "staged" | "unstaged" | "commits" | "full">(
     "working_tree"
   );
 
@@ -173,6 +173,12 @@ function SubmitReviewContent() {
             setTargetRef(brRes.branches[Math.min(1, brRes.branches.length - 1)].name);
           }
         } else {
+          if (localMode === "full") {
+            setPreviewDiff("");
+            setPreviewFiles([]);
+            setPreviewCommits({ base: "EMPTY_TREE", target: selectedRepo!.default_branch || "HEAD" });
+            return;
+          }
           const insp = await apiFetch<{
             branches: string[];
             base_commit: string;
@@ -213,6 +219,10 @@ function SubmitReviewContent() {
     setStatusNotice("");
     try {
       if (selectedRepo.source_type === "github") {
+        if (githubMode === "full") {
+          setStatusNotice("Full codebase audit inspects prioritized source files directly — submit review to start.");
+          return;
+        }
         if (githubMode === "pr" && selectedPr) {
           const res = await apiFetch<{
             base_commit: string;
@@ -253,6 +263,9 @@ function SubmitReviewContent() {
           setPreviewFiles(res.changed_files);
           setPreviewCommits({ base: res.base_commit, target: res.target_commit });
         }
+      } else if (localMode === "full") {
+        setStatusNotice("Full codebase audit scans all non-excluded files directly — submit review to start.");
+        return;
       } else {
         const q = new URLSearchParams({ mode: localMode });
         if (localMode === "commits") {
@@ -295,7 +308,10 @@ function SubmitReviewContent() {
     try {
       const body: Record<string, unknown> = { repository_id: selectedRepo.id };
       if (selectedRepo.source_type === "github") {
-        if (githubMode === "pr") {
+        if (githubMode === "full") {
+          body.full_codebase = true;
+          body.target_ref = selectedRepo.default_branch || targetRef || "main";
+        } else if (githubMode === "pr") {
           if (!selectedPr) throw new Error("Select a Pull Request first");
           body.pr_number = Number(selectedPr);
         } else if (githubMode === "commit") {
@@ -305,6 +321,9 @@ function SubmitReviewContent() {
           body.base_ref = baseRef;
           body.target_ref = targetRef;
         }
+      } else if (localMode === "full") {
+        body.full_codebase = true;
+        body.target_ref = selectedRepo.default_branch || "HEAD";
       } else {
         body.local_mode = localMode;
         if (localMode === "commits") {
@@ -426,6 +445,7 @@ function SubmitReviewContent() {
                 { key: "pr", label: `Pull Request (${pulls.length} open)` },
                 { key: "commit", label: `Specific Commit (${commits.length})` },
                 { key: "compare", label: "Compare Branches / Commits" },
+                { key: "full", label: "Full Codebase Audit" },
               ].map((m) => (
                 <button
                   key={m.key}
@@ -442,7 +462,12 @@ function SubmitReviewContent() {
               ))}
             </div>
 
-            {githubMode === "pr" ? (
+            {githubMode === "full" ? (
+              <p className="rounded-lg border border-border bg-muted/60 px-3 py-2 text-xs text-muted-foreground">
+                Audits up to 50 security-prioritized source files on branch{" "}
+                <code className="font-mono text-foreground">{selectedRepo.default_branch}</code> with all 6 Swarm agents.
+              </p>
+            ) : githubMode === "pr" ? (
               <div>
                 <label htmlFor="pr-select" className="mb-1.5 block text-xs font-semibold">
                   Open Pull Request
@@ -532,6 +557,7 @@ function SubmitReviewContent() {
                 <option value="staged">Staged Changes Only (git diff --cached)</option>
                 <option value="unstaged">Unstaged Changes Only (git diff)</option>
                 <option value="commits">Commit / Branch Range (base..target)</option>
+                <option value="full">Full Codebase Audit</option>
               </select>
             </div>
             {localMode === "commits" && (

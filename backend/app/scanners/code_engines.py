@@ -95,8 +95,8 @@ def is_test_fixture_hit(
             start = max(0, line_number - 6)
             end = min(len(lines), line_number + 4)
             combined += "\n" + "\n".join(lines[start:end]).lower()
-        except Exception:
-            pass
+        except OSError:
+            return any(marker in combined for marker in _SYNTHETIC_FIXTURE_MARKERS)
     return any(marker in combined for marker in _SYNTHETIC_FIXTURE_MARKERS)
 
 
@@ -152,7 +152,7 @@ def read_prioritized_workspace_files(
                 continue
             if target.stat().st_size > 160_000:
                 continue
-        except Exception:
+        except OSError:
             continue
 
         raw = target.read_text(encoding="utf-8", errors="replace")

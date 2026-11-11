@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import re
 from pathlib import Path
 from typing import Any
 
+from git import GitCommandError
 from git import Repo as GitRepo
-
 from repository_reader import is_sensitive_path
 
 _DIFF_HDR = re.compile(r"^diff --git a/(.*?) b/(.*?)$")
@@ -53,7 +54,7 @@ def extract_diff(
     head_sha = repo.head.commit.hexsha if repo.head.is_valid() else "UNBORN"
     try:
         base_branch = repo.active_branch.name
-    except Exception:
+    except TypeError:
         base_branch = "HEAD"
 
     if mode == "staged":
@@ -104,10 +105,8 @@ def extract_diff(
             if target_commit in ("WORKING_TREE", "STAGED", "UNSTAGED"):
                 snapshots[rel] = fp.read_text(encoding="utf-8", errors="replace")
             else:
-                try:
+                with contextlib.suppress(GitCommandError):
                     snapshots[rel] = repo.git.show(f"{target_commit}:{rel}")
-                except Exception:
-                    pass
 
     return {
         "repository_name": repo_path.name,

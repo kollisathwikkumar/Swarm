@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+
+import jwt
 from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
@@ -10,6 +13,7 @@ from app.database.session import get_db
 from app.models.tables import ConnectedAccount, User
 from app.services.crypto import decode_access_token, decrypt_secret, hash_password
 
+logger = logging.getLogger(__name__)
 bearer_scheme = HTTPBearer(auto_error=False)
 
 WORKSPACE_EMAIL = "workspace@reviewboard.local"
@@ -22,7 +26,7 @@ async def get_or_create_workspace_user(db: AsyncSession) -> User:
         return user
     user = User(
         email=WORKSPACE_EMAIL,
-        name="ReviewBoard Workspace",
+        name="Swarm Workspace",
         password_hash=hash_password("local-workspace-no-auth"),
         role="admin",
     )
@@ -45,8 +49,8 @@ async def get_current_user(
                 user = res.scalar_one_or_none()
                 if user:
                     return user
-        except Exception:
-            pass
+        except (jwt.PyJWTError, ValueError) as exc:
+            logger.debug("Ignoring invalid bearer token, using local workspace user: %s", exc)
     return await get_or_create_workspace_user(db)
 
 

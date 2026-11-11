@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import shutil
 import sys
@@ -56,14 +57,10 @@ async def run_command_capture(
         stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         timed_out = False
     except asyncio.CancelledError:
-        try:
+        with contextlib.suppress(ProcessLookupError):
             proc.kill()
-        except ProcessLookupError:
-            pass
-        try:
+        with contextlib.suppress(ProcessLookupError, OSError):
             await proc.wait()
-        except Exception:
-            pass
         raise
     except TimeoutError:
         proc.kill()

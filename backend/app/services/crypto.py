@@ -4,7 +4,7 @@ import base64
 import hashlib
 import hmac
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import jwt
 from cryptography.fernet import Fernet, InvalidToken
@@ -18,7 +18,7 @@ def _get_fernet() -> Fernet:
         raw_key = settings.encryption_key.encode("utf-8")
         try:
             return Fernet(raw_key)
-        except Exception:
+        except ValueError:
             digest = hashlib.sha256(raw_key).digest()
             return Fernet(base64.urlsafe_b64encode(digest))
     digest = hashlib.sha256(settings.secret_key.encode("utf-8")).digest()
@@ -64,13 +64,13 @@ def verify_password(password: str, stored_hash: str) -> bool:
         expected_dk = base64.b64decode(dk_b64)
         computed = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
         return hmac.compare_digest(computed, expected_dk)
-    except Exception:
+    except (ValueError, TypeError):
         return False
 
 
 def create_access_token(user_id: str, email: str, expires_hours: int = 24 * 7) -> str:
     settings = get_settings()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     payload = {
         "sub": user_id,
         "email": email,

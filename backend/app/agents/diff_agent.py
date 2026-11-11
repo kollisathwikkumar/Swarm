@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -18,7 +19,9 @@ from app.orchestration.shared_state import (
 from app.scanners.code_engines import read_prioritized_workspace_files
 from app.scanners.git_diff_tool import collect_diff_context
 
-SYSTEM_PROMPT = """You are the Diff Agent in ReviewBoard, an automated multi-agent code review system.
+logger = logging.getLogger(__name__)
+
+SYSTEM_PROMPT = """You are the Diff Agent in Swarm, an automated multi-agent code review system.
 Analyze the submitted Git diff, affected files, line-numbered complete source files, and Polyglot Symbol & Defensive Guard Facts.
 Identify what changed, summarize the functional intent, and highlight concrete, verified behavioral or architectural bugs/risks.
 CRITICAL ACCURACY RULES:
@@ -204,6 +207,7 @@ class DiffAgentExecutor(Executor):
             )
             await ctx.send_message(out)
         except Exception as exc:
+            logger.exception("Diff Agent failed")
             duration_ms = int((time.perf_counter() - t0) * 1000)
             out = AgentExecutionOutput(
                 agent_name="diff_agent",
@@ -211,6 +215,7 @@ class DiffAgentExecutor(Executor):
                 model_used=cfg.model,
                 status="failed",
                 summary="Diff Agent execution failed.",
+                tool_results=diff_ctx,
                 error_message=str(exc),
                 duration_ms=duration_ms,
             )

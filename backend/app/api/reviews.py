@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import asyncio
+import logging
+import os
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
+from git import GitCommandError, InvalidGitRepositoryError
+from git import Repo as GitRepo
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, resolve_github_token
 from app.api.repositories import _extract_local_git_diff
-from app.config import AGENT_METADATA
 from app.database.session import get_db
 from app.integrations.github_client import GitHubAPIError, GitHubClient
 from app.models.tables import (
@@ -28,12 +32,51 @@ from app.orchestration.coordinator import (
     launch_review_job,
     load_effective_agent_configs,
     persist_review_stopped,
+    seed_agent_runs,
 )
 from app.scanners.code_engines import CODE_EXTENSIONS, prioritize_repo_files
 from app.scanners.git_diff_tool import parse_unified_diff
 from app.services.git_workspace import ensure_github_mirror, is_excluded_path, resolve_within_dir
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/reviews", tags=["reviews"])
+
+
+def _build_full_repo_payload(
+    snapshots: dict[str, str], ordered_paths: list[str], fallback_label: str
+) -> tuple[str, list[dict[str, Any]]]:
+    """Build synthetic unified diff and aligned changed_files list from loaded file snapshots."""
+    populated = [fp for fp in ordered_paths if fp in snapshots]
+    diff_chunks: list[str] = []
+    changed_files: list[dict[str, Any]] = []
+    for fp in populated:
+        content = snapshots[fp]
+        lines = content.splitlines()
+        capped = min(len(lines), 600)
+        body = "\n".join(f"+{ln}" for ln in lines[:capped])
+        patch = (
+            f"diff --git a/{fp} b/{fp}\n"
+            f"new file mode 100644\n"
+            f"--- /dev/null\n"
+            f"+++ b/{fp}\n"
+            f"@@ -0,0 +1,{capped} @@\n"
+            f"{body}"
+        )
+        diff_chunks.append(patch)
+        changed_files.append(
+            {
+                "path": fp,
+                "status": "added",
+                "additions": len(lines),
+                "deletions": 0,
+                "changed_lines": list(range(1, min(len(lines), 200) + 1)),
+                "patch": patch,
+            }
+        )
+    diff_text = "\n".join(diff_chunks) or (
+        f"diff --git a/README.md b/README.md\n--- /dev/null\n+++ b/README.md\n@@ -0,0 +1,1 @@\n+{fallback_label}"
+    )
+    return diff_text, changed_files
 
 
 class CreateReviewRequest(BaseModel):
@@ -107,16 +150,19 @@ async def _create_and_start_review(
                     and not is_excluded_path(item.get("path", ""))
                     and (item.get("size") or 0) < 120_000
                 ]
-                blob_paths = prioritize_repo_files(raw_paths)[:150]
-                for fp in blob_paths[:24]:
-                    try:
-                        content, _ = await gh.get_file_content(repo.owner, repo.name, fp, head_sha)
-                        snapshots[fp] = content
-                    except Exception:
-                        continue
-            except GitHubAPIError as exc:
-                from git import Repo as GitRepo
+                blob_paths = prioritize_repo_files(raw_paths)[:50]
+                sem = asyncio.Semaphore(8)
 
+                async def _fetch_blob(fp: str) -> None:
+                    async with sem:
+                        try:
+                            content, _ = await gh.get_file_content(repo.owner, repo.name, fp, head_sha)
+                            snapshots[fp] = content
+                        except (GitHubAPIError, UnicodeDecodeError) as f_exc:
+                            logger.debug("Skipping blob %s during full scan: %s", fp, f_exc)
+
+                await asyncio.gather(*(_fetch_blob(fp) for fp in blob_paths))
+            except GitHubAPIError as exc:
                 try:
                     mirror_dir = await ensure_github_mirror(
                         repo.owner,
@@ -125,8 +171,10 @@ async def _create_and_start_review(
                         ref=branch,
                         github_token=token,
                     )
-                except Exception as m_exc:
-                    raise HTTPException(status_code=exc.status_code, detail=f"{exc.message} (Mirror failed: {m_exc})")
+                except (RuntimeError, OSError, ValueError) as m_exc:
+                    raise HTTPException(
+                        status_code=exc.status_code, detail=f"{exc.message} (Mirror failed: {m_exc})"
+                    ) from m_exc
                 git_mirror = GitRepo(str(mirror_dir))
                 head_sha = git_mirror.head.commit.hexsha
                 raw_tree = git_mirror.git.ls_tree("-r", "--name-only", "HEAD")
@@ -135,21 +183,15 @@ async def _create_and_start_review(
                     for p in raw_tree.splitlines()
                     if p.endswith(CODE_EXTENSIONS) and not is_excluded_path(p)
                 ]
-                blob_paths = prioritize_repo_files(raw_paths)[:150]
-                for fp in blob_paths[:24]:
+                blob_paths = prioritize_repo_files(raw_paths)[:50]
+                for fp in blob_paths:
                     fp_full = resolve_within_dir(mirror_dir, fp)
                     if fp_full is not None and fp_full.exists() and fp_full.stat().st_size < 120_000:
                         snapshots[fp] = fp_full.read_text(encoding="utf-8", errors="replace")
 
-            diff_chunks: list[str] = []
-            for fp, content in snapshots.items():
-                lines = content.splitlines()
-                capped = min(len(lines), 600)
-                body = "\n".join(f"+{ln}" for ln in lines[:capped])
-                diff_chunks.append(
-                    f"diff --git a/{fp} b/{fp}\nnew file mode 100644\n--- /dev/null\n+++ b/{fp}\n@@ -0,0 +1,{capped} @@\n{body}"
-                )
-            diff_text = "\n".join(diff_chunks) or f"diff --git a/README.md b/README.md\n--- /dev/null\n+++ b/README.md\n@@ -0,0 +1,1 @@\n+Full codebase audit at {head_sha}"
+            diff_text, changed_files = _build_full_repo_payload(
+                snapshots, blob_paths, f"Full codebase audit at {head_sha}"
+            )
             base_commit = "EMPTY_TREE"
             target_commit = head_sha
             base_branch = "empty"
@@ -157,17 +199,6 @@ async def _create_and_start_review(
             pr_title = f"Full Codebase Audit ({branch})"
             pr_url = repo.html_url
             source_mode = "github_full_repo"
-            changed_files = [
-                {
-                    "path": fp,
-                    "status": "added",
-                    "additions": len((snapshots.get(fp) or "").splitlines()),
-                    "deletions": 0,
-                    "changed_lines": list(range(1, min(len((snapshots.get(fp) or "").splitlines()), 200) + 1)),
-                    "patch": "",
-                }
-                for fp in blob_paths
-            ]
         elif pr_number is not None:
             try:
                 pr = await gh.get_pull_request(repo.owner, repo.name, pr_number)
@@ -230,17 +261,54 @@ async def _create_and_start_review(
         repo_path = Path(repo.local_path).resolve()
         if not (repo_path / ".git").exists():
             raise HTTPException(status_code=400, detail=f"Not a valid Git repository: {repo_path}")
-        b_ref = base_ref or "HEAD~1"
-        t_ref = target_ref or "HEAD"
-        base_commit, target_commit, diff_text, snapshots = _extract_local_git_diff(
-            repo_path, mode=local_mode, base_ref=b_ref, target_ref=t_ref
-        )
-        base_branch = b_ref if local_mode == "commits" else repo.default_branch
-        target_branch = t_ref if local_mode == "commits" else local_mode
-        pr_title = None
-        pr_url = None
-        source_mode = "local_commits" if local_mode == "commits" else "local_diff"
-        changed_files = [p.to_dict() for p in parse_unified_diff(diff_text)]
+        if full_codebase:
+            try:
+                git_repo = GitRepo(str(repo_path))
+                head_sha = git_repo.head.commit.hexsha if git_repo.head.is_valid() else "WORKING_TREE"
+            except (InvalidGitRepositoryError, GitCommandError, ValueError):
+                head_sha = "WORKING_TREE"
+            raw_paths: list[str] = []
+            for p in repo_path.rglob("*"):
+                if p.is_symlink() or not p.is_file():
+                    continue
+                if any(
+                    part in (".git", "node_modules", ".venv", "__pycache__", ".next", "dist")
+                    for part in p.parts
+                ):
+                    continue
+                rel = str(p.relative_to(repo_path)).replace(os.sep, "/")
+                if not rel.endswith(CODE_EXTENSIONS) or is_excluded_path(rel):
+                    continue
+                if p.stat().st_size < 120_000:
+                    raw_paths.append(rel)
+            blob_paths = prioritize_repo_files(raw_paths)[:50]
+            for fp in blob_paths:
+                fp_full = resolve_within_dir(repo_path, fp)
+                if fp_full is not None and fp_full.exists():
+                    snapshots[fp] = fp_full.read_text(encoding="utf-8", errors="replace")
+            branch = (target_ref or repo.default_branch or "HEAD").strip()
+            diff_text, changed_files = _build_full_repo_payload(
+                snapshots, blob_paths, f"Local full codebase audit at {head_sha}"
+            )
+            base_commit = "EMPTY_TREE"
+            target_commit = head_sha
+            base_branch = "empty"
+            target_branch = branch
+            pr_title = f"Full Codebase Audit ({branch})"
+            pr_url = None
+            source_mode = "local_full_repo"
+        else:
+            b_ref = base_ref or "HEAD~1"
+            t_ref = target_ref or "HEAD"
+            base_commit, target_commit, diff_text, snapshots = _extract_local_git_diff(
+                repo_path, mode=local_mode, base_ref=b_ref, target_ref=t_ref
+            )
+            base_branch = b_ref if local_mode == "commits" else repo.default_branch
+            target_branch = t_ref if local_mode == "commits" else local_mode
+            pr_title = None
+            pr_url = None
+            source_mode = "local_commits" if local_mode == "commits" else "local_diff"
+            changed_files = [p.to_dict() for p in parse_unified_diff(diff_text)]
 
     if not diff_text.strip():
         raise HTTPException(
@@ -278,16 +346,7 @@ async def _create_and_start_review(
     await db.flush()
 
     configs = await load_effective_agent_configs(db)
-    for key, meta in AGENT_METADATA.items():
-        db.add(
-            AgentRun(
-                review_id=rev.id,
-                agent_name=key,
-                agent_label=meta["label"],
-                model_used=configs[key].model,
-                status="queued",
-            )
-        )
+    await seed_agent_runs(db, rev.id, configs)
 
     await db.commit()
     await db.refresh(rev)
@@ -511,7 +570,7 @@ async def rerun_review(
         db=db,
         pr_number=cc.pr_number,
         commit_sha=cc.target_commit if cc.source_mode == "github_commit" else None,
-        full_codebase=cc.source_mode == "github_full_repo",
+        full_codebase=cc.source_mode in ("github_full_repo", "local_full_repo"),
         base_ref=cc.base_branch,
         target_ref=cc.target_branch,
         local_mode=local_mode,

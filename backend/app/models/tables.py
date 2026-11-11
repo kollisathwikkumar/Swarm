@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     DateTime,
     ForeignKey,
     Integer,
-    JSON,
     String,
     Text,
     UniqueConstraint,
@@ -19,7 +19,7 @@ from app.database.session import Base
 
 
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def new_id() -> str:
@@ -36,10 +36,10 @@ class User(Base):
     role: Mapped[str] = mapped_column(String(32), default="developer", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
-    connected_accounts: Mapped[list["ConnectedAccount"]] = relationship(
+    connected_accounts: Mapped[list[ConnectedAccount]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
-    repositories: Mapped[list["Repository"]] = relationship(
+    repositories: Mapped[list[Repository]] = relationship(
         back_populates="owner_user", cascade="all, delete-orphan"
     )
 
@@ -59,7 +59,7 @@ class ConnectedAccount(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
-    user: Mapped["User"] = relationship(back_populates="connected_accounts")
+    user: Mapped[User] = relationship(back_populates="connected_accounts")
 
 
 class Repository(Base):
@@ -82,11 +82,11 @@ class Repository(Base):
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
-    owner_user: Mapped["User"] = relationship(back_populates="repositories")
-    code_changes: Mapped[list["CodeChange"]] = relationship(
+    owner_user: Mapped[User] = relationship(back_populates="repositories")
+    code_changes: Mapped[list[CodeChange]] = relationship(
         back_populates="repository", cascade="all, delete-orphan"
     )
-    reviews: Mapped[list["Review"]] = relationship(
+    reviews: Mapped[list[Review]] = relationship(
         back_populates="repository", cascade="all, delete-orphan"
     )
 
@@ -109,8 +109,8 @@ class CodeChange(Base):
     file_snapshots: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
-    repository: Mapped["Repository"] = relationship(back_populates="code_changes")
-    reviews: Mapped[list["Review"]] = relationship(back_populates="code_change")
+    repository: Mapped[Repository] = relationship(back_populates="code_changes")
+    reviews: Mapped[list[Review]] = relationship(back_populates="code_change")
 
 
 class Review(Base):
@@ -132,18 +132,18 @@ class Review(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    repository: Mapped["Repository"] = relationship(back_populates="reviews")
-    code_change: Mapped["CodeChange"] = relationship(back_populates="reviews")
-    agent_runs: Mapped[list["AgentRun"]] = relationship(
+    repository: Mapped[Repository] = relationship(back_populates="reviews")
+    code_change: Mapped[CodeChange] = relationship(back_populates="reviews")
+    agent_runs: Mapped[list[AgentRun]] = relationship(
         back_populates="review", cascade="all, delete-orphan"
     )
-    findings: Mapped[list["Finding"]] = relationship(
+    findings: Mapped[list[Finding]] = relationship(
         back_populates="review", cascade="all, delete-orphan"
     )
-    artifacts: Mapped[list["ReviewArtifact"]] = relationship(
+    artifacts: Mapped[list[ReviewArtifact]] = relationship(
         back_populates="review", cascade="all, delete-orphan"
     )
-    patch_suggestions: Mapped[list["PatchSuggestion"]] = relationship(
+    patch_suggestions: Mapped[list[PatchSuggestion]] = relationship(
         back_populates="review", cascade="all, delete-orphan"
     )
 
@@ -165,7 +165,7 @@ class AgentRun(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    review: Mapped["Review"] = relationship(back_populates="agent_runs")
+    review: Mapped[Review] = relationship(back_populates="agent_runs")
 
 
 class Finding(Base):
@@ -193,8 +193,8 @@ class Finding(Base):
     is_blocking: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
-    review: Mapped["Review"] = relationship(back_populates="findings")
-    patch_suggestions: Mapped[list["PatchSuggestion"]] = relationship(
+    review: Mapped[Review] = relationship(back_populates="findings")
+    patch_suggestions: Mapped[list[PatchSuggestion]] = relationship(
         back_populates="finding", cascade="all, delete-orphan"
     )
 
@@ -210,7 +210,7 @@ class ReviewArtifact(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
-    review: Mapped["Review"] = relationship(back_populates="artifacts")
+    review: Mapped[Review] = relationship(back_populates="artifacts")
 
 
 class PatchSuggestion(Base):
@@ -236,8 +236,8 @@ class PatchSuggestion(Base):
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
-    review: Mapped["Review"] = relationship(back_populates="patch_suggestions")
-    finding: Mapped["Finding | None"] = relationship(back_populates="patch_suggestions")
+    review: Mapped[Review] = relationship(back_populates="patch_suggestions")
+    finding: Mapped[Finding | None] = relationship(back_populates="patch_suggestions")
 
 
 class ReviewPolicy(Base):

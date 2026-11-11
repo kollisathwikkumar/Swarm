@@ -99,7 +99,7 @@ def _python_ast_summary(file_path: Path) -> dict[str, Any]:
     try:
         src = file_path.read_text(encoding="utf-8", errors="replace")
         tree = ast.parse(src)
-    except Exception:
+    except (OSError, SyntaxError, ValueError):
         return {}
     functions = []
     classes = []

@@ -438,7 +438,7 @@ export default function RepositoryExplorerPage() {
               Review PR / Commit
             </Link>
 
-            {treeData?.repository.source_type === "github" && (
+            {treeData && (
               <button
                 type="button"
                 disabled={startingAudit || loadingTree}

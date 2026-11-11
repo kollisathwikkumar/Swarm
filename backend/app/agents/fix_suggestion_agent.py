@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import difflib
 import json
+import logging
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import Any
 from agent_framework import Executor, WorkflowContext, handler
 
 from app.agents.llm_factory import MissingAPIKeyError, run_structured_agent
+from app.agents.reviewer_manager import _evaluate_review_policy
 from app.orchestration.cancellation import ReviewCancelledError, is_review_cancelled
 from app.orchestration.shared_state import (
     AgentExecutionOutput,
@@ -20,7 +22,9 @@ from app.orchestration.shared_state import (
 from app.scanners.code_engines import is_test_file_path, verify_code_syntax
 from app.services.git_workspace import resolve_within_dir, verify_patch_applicability
 
-SYSTEM_PROMPT = """You are the Fix-Suggestion Agent in ReviewBoard.
+logger = logging.getLogger(__name__)
+
+SYSTEM_PROMPT = """You are the Fix-Suggestion Agent in Swarm.
 You receive a high-priority actionable code review finding, the exact target source code, and any Existing Test Contracts covering that file.
 Rules:
 1. Fix ONLY the identified defect cleanly with minimal collateral changes, preserving indentation, exports, and existing public behavior.
@@ -64,7 +68,7 @@ def _assemble_corrected_file(
 
 
 def _select_target_findings(
-    workspace_dir: Path, findings: list[dict[str, Any]], max_patches: int = 2
+    workspace_dir: Path, findings: list[dict[str, Any]], max_patches: int = 5
 ) -> list[tuple[int, dict[str, Any]]]:
     """Select top Verified/actionable source-file defects (skipping Unverified guesses and test-fixture alerts)."""
     sev_weight = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
@@ -121,8 +125,8 @@ def _extract_test_contract_context(state: ReviewState, rel_path: str) -> str:
     excerpts: list[str] = []
     used = 0
     for test_rel in related_tests[:2]:
-        tp = (state.workspace_dir / test_rel).resolve()
-        if not tp.exists() or not tp.is_file() or tp.stat().st_size > 120_000:
+        tp = resolve_within_dir(state.workspace_dir, test_rel)
+        if tp is None or not tp.exists() or not tp.is_file() or tp.stat().st_size > 120_000:
             continue
         lines = tp.read_text(encoding="utf-8", errors="replace").splitlines()
         relevant = [
@@ -174,7 +178,7 @@ class FixSuggestionAgentExecutor(Executor):
             },
         )
 
-        targets = _select_target_findings(state.workspace_dir, state.findings, max_patches=2)
+        targets = _select_target_findings(state.workspace_dir, state.findings, max_patches=5)
         if not targets:
             duration_ms = int((time.perf_counter() - t0) * 1000)
             state.agent_results["fix_suggestion_agent"] = AgentExecutionOutput(
@@ -322,6 +326,7 @@ class FixSuggestionAgentExecutor(Executor):
             status = "incomplete"
             err_msg = str(exc)
         except Exception as exc:
+            logger.exception("Fix-Suggestion Agent failed")
             status = "failed"
             err_msg = str(exc)
 
@@ -343,6 +348,12 @@ class FixSuggestionAgentExecutor(Executor):
             error_message=err_msg,
             duration_ms=duration_ms,
         ).to_dict()
+        rec, reason, evaluated_findings = _evaluate_review_policy(
+            state, state.findings, list(state.agent_results.values())
+        )
+        state.findings = evaluated_findings
+        state.recommendation = rec
+        state.recommendation_reason = reason
         state.review_status = "completed"
 
         await self._emit(
@@ -355,6 +366,7 @@ class FixSuggestionAgentExecutor(Executor):
                 "model": cfg.model,
                 "duration_ms": duration_ms,
                 "patches_count": len(proposals),
+                "recommendation": rec,
                 "summary": summary,
             },
         )

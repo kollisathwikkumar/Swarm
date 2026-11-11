@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -18,7 +19,9 @@ from app.orchestration.shared_state import (
 from app.scanners.code_engines import is_test_file_path, read_prioritized_workspace_files
 from app.scanners.test_tools import run_test_and_coverage
 
-SYSTEM_PROMPT = """You are the Test-Coverage Agent in ReviewBoard, an automated multi-agent code review system.
+logger = logging.getLogger(__name__)
+
+SYSTEM_PROMPT = """You are the Test-Coverage Agent in Swarm, an automated multi-agent code review system.
 You receive real test runner results (Pytest / Coverage.py or Vitest), the full Cross-File Test-Import Coverage Map (`test_import_map`), extracted test case lists (`test_suites`), and line-numbered changed files.
 CRITICAL ACCURACY RULES:
 1. NEVER emit a finding claiming "Test-runner mismatch / 0 Python tests found" against a TypeScript/JavaScript project — that is review harness telemetry, not a defect in the user's code.
@@ -143,7 +146,7 @@ class TestCoverageAgentExecutor(Executor):
 
             agent_status = "completed"
             err_msg = None
-            if test_res.get("status") in ("incomplete", "tool_unavailable"):
+            if test_res.get("status") in ("error", "incomplete", "tool_unavailable"):
                 agent_status = "incomplete"
                 err_msg = test_res.get("error") or "Test execution incomplete"
 
@@ -198,6 +201,7 @@ class TestCoverageAgentExecutor(Executor):
             )
             await ctx.send_message(out)
         except Exception as exc:
+            logger.exception("Test-Coverage Agent failed")
             duration_ms = int((time.perf_counter() - t0) * 1000)
             out = AgentExecutionOutput(
                 agent_name="test_coverage_agent",
@@ -205,6 +209,7 @@ class TestCoverageAgentExecutor(Executor):
                 model_used=cfg.model,
                 status="failed",
                 summary="Test-Coverage Agent failed.",
+                tool_results=test_res,
                 error_message=str(exc),
                 duration_ms=duration_ms,
             )

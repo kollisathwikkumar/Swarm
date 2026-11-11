@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections import OrderedDict
 import contextvars
+import logging
+from collections import OrderedDict
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # Tracks active review execution ID per async task context so HTTP SDK calls can abort on Stop.
 review_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("rb_review_id", default="")
@@ -77,8 +80,8 @@ async def cancel_review_execution(review_id: str) -> bool:
     for client in clients:
         try:
             await asyncio.wait_for(client.close(), timeout=1.5)
-        except Exception:
-            pass
+        except (OSError, RuntimeError, TimeoutError) as exc:
+            logger.debug("Ignoring client close failure for %s: %s", review_id, exc)
 
     task = _ACTIVE_TASKS.get(review_id)
     cancelled_task = False
