@@ -33,6 +33,8 @@ class StructuredFinding:
     deduplicated_sources: list[str] = field(default_factory=list)
     priority_rank: int = 100
     is_blocking: bool = False
+    evidence_ids: list[str] = field(default_factory=list)
+    confidence: float = 0.5
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -52,6 +54,8 @@ class StructuredFinding:
             "deduplicated_sources": self.deduplicated_sources,
             "priority_rank": self.priority_rank,
             "is_blocking": self.is_blocking,
+            "evidence_ids": self.evidence_ids,
+            "confidence": self.confidence,
         }
 
 
@@ -124,6 +128,11 @@ class ReviewState:
     agent_configs: dict[str, AgentExecutionConfig]
     diff_summary: str = ""
     diff_context: dict[str, Any] = field(default_factory=dict)
+    cache_dir: Path | None = None
+    structure_index: dict[str, Any] = field(default_factory=dict)
+    review_plan: dict[str, Any] = field(default_factory=dict)
+    evidence_store: list[dict[str, Any]] = field(default_factory=list)
+    cache_stats: dict[str, Any] = field(default_factory=dict)
     agent_results: dict[str, dict[str, Any]] = field(default_factory=dict)
     findings: list[dict[str, Any]] = field(default_factory=list)
     recommendation: str = "Pending"  # Approve | Request Changes | Incomplete
@@ -172,5 +181,15 @@ class ReviewState:
                 }
                 for p in self.patch_proposals
             ],
+            "review_plan": self.review_plan,
+            "structure_index_summary": {
+                "files_indexed": self.structure_index.get("files_indexed", 0),
+                "symbols_indexed": self.structure_index.get("symbols_indexed", 0),
+                "edges_indexed": self.structure_index.get("edges_indexed", 0),
+                "tree_sitter_active": self.structure_index.get("tree_sitter_active", False),
+                "languages": self.structure_index.get("languages", []),
+            },
+            "evidence_store_count": len(self.evidence_store),
+            "cache_stats": self.cache_stats,
             "review_status": self.review_status,
         }

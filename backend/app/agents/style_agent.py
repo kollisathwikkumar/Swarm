@@ -10,19 +10,22 @@ from typing import Any
 from agent_framework import Executor, WorkflowContext, handler
 
 from app.agents.llm_factory import MissingAPIKeyError, run_structured_agent
+from app.cache.review_cache import ReviewCache, hash_config_dict
+from app.intelligence.context_builder import build_agent_context
 from app.orchestration.cancellation import ReviewCancelledError, is_review_cancelled
 from app.orchestration.shared_state import (
     AgentExecutionOutput,
     ReviewState,
     StructuredFinding,
 )
-from app.scanners.code_engines import prioritize_repo_files, read_prioritized_workspace_files
+from app.scanners.code_engines import prioritize_repo_files
 from app.scanners.style_tools import run_style_scanners
+from app.skills.shared_contracts import format_agent_contract
 
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are the Style Agent in Swarm, an automated multi-agent code review system.
-Review the deterministic style/linter outputs (Ruff, AST complexity, duplicate detection) and the actual changed code.
+Review the deterministic style/linter outputs (Ruff, AST complexity, duplicate detection) and the STAIR structural context slices.
 Identify formatting inconsistencies, naming convention violations, code duplication, and readability/maintainability issues.
 Return strict JSON with this schema:
 {
@@ -35,15 +38,14 @@ Return strict JSON with this schema:
       "file_path": "exact/path/from/repo.py",
       "line_number": 12,
       "evidence": "Exact code line or linter rule evidence",
-      "tool_name": "ruff|ast-complexity|duplicate-detector|llm-style-review",
+      "tool_name": "ruff|ast-complexity|duplicate-detector|ts-syntax-checker|llm-style-review",
       "rule_id": "E501 or STYLE-NAMING etc",
       "recommendation": "Specific refactoring or formatting fix",
-      "verification_status": "Verified|Needs Verification"
+      "confidence": 0.9
     }
   ]
 }
-Mark findings backed by Ruff/AST/duplicate-detector as "Verified", and purely LLM-spotted style advice as "Needs Verification".
-Never invent file paths or line numbers."""
+Never self-certify findings as Verified (EvidenceGuard verifies tool citations independently). Never invent file paths, lines, or deterministic linter hits."""
 
 
 class StyleAgentExecutor(Executor):
@@ -75,30 +77,53 @@ class StyleAgentExecutor(Executor):
             if is_review_cancelled(state.review_id):
                 raise ReviewCancelledError("Review stopped by user.")
             changed_paths = [f.get("path", "") for f in state.changed_files if f.get("path")]
-            style_res = await run_style_scanners(state.workspace_dir, changed_paths)
-            ruff_count = len(style_res["ruff"]["findings"])
-            ast_count = len(style_res["ast_checks"]["findings"])
+            agent_plan = (state.review_plan.get("agent_plans") or {}).get("style_agent") or {}
+            cache = ReviewCache(state.cache_dir or (state.workspace_dir.parent / "_cache"))
+            commit_ctx = f"{state.base_commit}..{state.target_commit}"
+            style_res = await run_style_scanners(
+                state.workspace_dir,
+                changed_paths,
+                cache=cache,
+                commit_context=commit_ctx,
+                config_hash=hash_config_dict({"policy": state.policy, "style_plan": agent_plan}),
+                plan=agent_plan,
+            )
+            style_res["cache_stats"] = cache.stats.to_dict()
+            ruff_count = len((style_res.get("ruff") or {}).get("findings", []))
+            ast_count = len((style_res.get("ast_checks") or {}).get("findings", []))
             await self._emit(
                 state.review_id,
                 "agent_progress",
                 {
                     "agent_name": "style_agent",
-                    "message": f"Ruff & AST scanners completed ({ruff_count} ruff, {ast_count} AST/duplicate hints)",
+                    "message": (
+                        f"Ruff & AST scanners completed ({ruff_count} ruff, {ast_count} AST/duplicate hints"
+                        + (", cache hit)" if style_res.get("cache_hit") else ")")
+                    ),
                 },
             )
 
-            full_sources = read_prioritized_workspace_files(
-                state.workspace_dir,
-                changed_paths,
-                max_files=10,
-                max_total_chars=20000,
-                per_file_chars=8000,
+            style_evidence = (
+                (style_res.get("ruff") or {}).get("findings", [])
+                + (style_res.get("ast_checks") or {}).get("findings", [])
             )
+            stair_ctx = build_agent_context(
+                role="style_agent",
+                workspace_dir=state.workspace_dir,
+                structure_index=state.structure_index,
+                changed_files=state.changed_files,
+                diff_text=state.diff_text,
+                evidence_items=style_evidence,
+                target_files=agent_plan.get("focus_files"),
+                token_budget=agent_plan.get("token_budget"),
+            )
+            contract_block = format_agent_contract("style_agent", agent_plan)
             user_prompt = (
                 f"Repository: {state.repository_name}\n"
                 f"Changed files: {json.dumps(prioritize_repo_files(changed_paths)[:40])}\n\n"
+                f"{contract_block}\n\n"
                 f"Deterministic Style, Syntax & AST Tool Results:\n{json.dumps(style_res, indent=2)[:8000]}\n\n"
-                f"Line-Numbered Changed Source Files:\n{json.dumps(full_sources, indent=2)[:20000]}\n\n"
+                f"{stair_ctx['context_text']}\n\n"
                 f"Code Diff Excerpt:\n```diff\n{(state.diff_text or '')[:8000]}\n```"
             )
             llm_out = await run_structured_agent(
@@ -108,15 +133,11 @@ class StyleAgentExecutor(Executor):
             findings: list[StructuredFinding] = []
             for item in llm_out.get("findings", []) or []:
                 tool_name = str(item.get("tool_name") or "llm-style-review")
-                is_det = tool_name in (
-                    "ruff",
-                    "ast-complexity",
-                    "ast-style-checker",
-                    "js-style-checker",
-                    "duplicate-detector",
-                    "python-ast",
-                    "ts-syntax-checker",
-                )
+                raw_conf = item.get("confidence", 0.7 if tool_name != "llm-style-review" else 0.5)
+                try:
+                    conf = max(0.0, min(1.0, float(raw_conf)))
+                except (TypeError, ValueError):
+                    conf = 0.5
                 findings.append(
                     StructuredFinding(
                         agent="Style Agent",
@@ -129,9 +150,10 @@ class StyleAgentExecutor(Executor):
                         end_line=None,
                         evidence=str(item.get("evidence") or ""),
                         recommendation=str(item.get("recommendation") or ""),
-                        verification_status="Verified" if is_det else "Needs Verification",
+                        verification_status="Needs Verification",
                         tool_name=tool_name,
                         rule_id=item.get("rule_id"),
+                        confidence=conf,
                     )
                 )
 

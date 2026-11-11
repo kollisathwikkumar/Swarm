@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from agent_framework import Executor, WorkflowBuilder, WorkflowContext, handler
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = BACKEND_ROOT.parent
@@ -994,6 +995,341 @@ async def test_local_full_codebase_policy_clearing_and_repo_toggle(tmp_path: Pat
         app.dependency_overrides.clear()
         get_settings.cache_clear()
         await test_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_p0_evidence_guard_blocks_fabrication_and_gates_patches(tmp_path: Path):
+    from app.agents.fix_suggestion_agent import _select_target_findings, _validate_patch_bundle
+    from app.verification.evidence_guard import (
+        build_evidence_store,
+        is_patch_eligible,
+        verify_finding_provenance,
+    )
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir(parents=True)
+    target_file = src_dir / "auth.py"
+    target_file.write_text(
+        "def safe_header() -> str:\n"
+        "    return 'ok'\n\n\n"
+        "def run_unsafe(cmd: str):\n"
+        "    import subprocess\n"
+        "    # line 7\n"
+        "    # line 8\n"
+        "    # line 9\n"
+        "    return subprocess.run(cmd, shell=True)\n",
+        encoding="utf-8",
+    )
+
+    sec_out = AgentExecutionOutput(
+        agent_name="security_agent",
+        agent_label="Security Agent",
+        model_used="deepseek-v4-pro",
+        status="completed",
+        summary="Bandit scan completed.",
+        tool_results={
+            "bandit": {
+                "status": "completed",
+                "findings": [
+                    {
+                        "tool": "bandit",
+                        "rule_id": "B602",
+                        "file_path": "src/auth.py",
+                        "line_number": 10,
+                        "severity": "High",
+                        "evidence": "subprocess.run(cmd, shell=True)",
+                        "title": "subprocess call with shell=True",
+                    }
+                ],
+            }
+        },
+    )
+
+    records, extras = build_evidence_store([sec_out], tmp_path, "deadbeef")
+    assert len(records) == 1
+    assert records[0].evidence_id == "EV-001"
+    assert len(extras["evidence_store"]) == 1
+
+    # 1. Fabricated tool claim pointing at unrelated line 2 cannot self-certify Verified
+    fabricated_claim = {
+        "agent": "Security Agent",
+        "severity": "High",
+        "title": "Fake bandit claim",
+        "file_path": "src/auth.py",
+        "line_number": 2,
+        "tool_name": "bandit",
+        "rule_id": "B602",
+        "verification_status": "Verified",
+        "confidence": 0.99,
+    }
+    res_fab, is_fab = verify_finding_provenance(fabricated_claim, records, tmp_path)
+    assert is_fab is True
+    assert res_fab["verification_status"] == "Needs Verification"
+    assert res_fab["tool_name"] == "llm-review"
+    assert res_fab["evidence_ids"] == []
+
+    # 2. Missing file -> Unverified
+    missing_claim = {
+        "agent": "Security Agent",
+        "severity": "High",
+        "title": "Ghost file",
+        "file_path": "src/nonexistent.py",
+        "line_number": 5,
+        "tool_name": "bandit",
+    }
+    res_miss, is_miss_fab = verify_finding_provenance(missing_claim, records, tmp_path)
+    assert is_miss_fab is True
+    assert res_miss["verification_status"] == "Unverified"
+    assert res_miss["evidence_ids"] == []
+
+    # 3. Real deterministic match -> Verified + EV-001 + confidence preserved
+    real_claim = {
+        "agent": "Security Agent",
+        "severity": "High",
+        "title": "subprocess call with shell=True",
+        "file_path": "src/auth.py",
+        "line_number": 10,
+        "tool_name": "bandit",
+        "rule_id": "B602",
+        "verification_status": "Needs Verification",
+        "confidence": 0.92,
+    }
+    res_real, is_real_fab = verify_finding_provenance(real_claim, records, tmp_path)
+    assert is_real_fab is False
+    assert res_real["verification_status"] == "Verified"
+    assert res_real["evidence_ids"] == ["EV-001"]
+    assert res_real["confidence"] == 0.92
+
+    # 4. Patch selection strictly gates on Verified + non-empty evidence_ids
+    verified_no_ev = {
+        "severity": "High",
+        "file_path": "src/auth.py",
+        "verification_status": "Verified",
+        "evidence_ids": [],
+    }
+    assert is_patch_eligible(verified_no_ev) is False
+    assert is_patch_eligible(res_fab) is False
+    assert is_patch_eligible(res_real) is True
+
+    selected = _select_target_findings(tmp_path, [res_fab, verified_no_ev, res_real], max_patches=5)
+    assert len(selected) == 1
+    assert selected[0][1]["evidence_ids"] == ["EV-001"]
+
+    # 5. Patch bundle security-guard recheck blocks patches introducing new High/Critical guard risks
+    clean_file = tmp_path / "src" / "clean.ts"
+    clean_file.write_text("export function runSafe(name: string): string {\n  return name.trim();\n}\n", encoding="utf-8")
+    unsafe_proposed = "import { execSync } from 'node:child_process';\nexport function runSafe(name: string): string {\n  return String(execSync(`cat ${name}`));\n}\n"
+    diff_bad = _compute_unified_diff("src/clean.ts", clean_file.read_text(encoding="utf-8"), unsafe_proposed)
+    combined_ok, _apply_ok, _syntax_ok, val_msg = await _validate_patch_bundle(
+        tmp_path, "src/clean.ts", unsafe_proposed, diff_bad
+    )
+    assert combined_ok is False
+    assert "security guard" in val_msg.lower()
+
+
+def test_p1_stair_hierarchical_retrieval_finds_deep_symbol_and_caller(tmp_path: Path):
+    from app.intelligence.context_builder import build_agent_context
+    from app.intelligence.structure_indexer import build_structure_index
+
+    pkg_dir = tmp_path / "pkg"
+    tests_dir = tmp_path / "tests"
+    pkg_dir.mkdir(parents=True)
+    tests_dir.mkdir(parents=True)
+    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
+
+    # Build a >420-line module so linear truncation from line 1 would completely miss process_payment
+    filler_lines = [
+        f"def filler_helper_{i:03d}(x: int) -> int:\n    return x + {i}\n\n"
+        for i in range(1, 135)
+    ]
+    deep_offset = sum(s.count("\n") for s in filler_lines) + 1
+    deep_func = (
+        "from pkg.auth_utils import verify_token\n\n"
+        "def process_payment(token: str, amount: float) -> bool:\n"
+        "    if not verify_token(token):\n"
+        "        return False\n"
+        "    return amount > 0\n"
+    )
+    (pkg_dir / "service.py").write_text("".join(filler_lines) + deep_func, encoding="utf-8")
+    (pkg_dir / "auth_utils.py").write_text(
+        "def verify_token(token: str) -> bool:\n    return len(token) > 10\n",
+        encoding="utf-8",
+    )
+    (pkg_dir / "routes.py").write_text(
+        "from pkg.service import process_payment\n\n"
+        "def handle_checkout(token: str) -> bool:\n"
+        "    return process_payment(token, 42.0)\n",
+        encoding="utf-8",
+    )
+    (tests_dir / "test_service.py").write_text(
+        "from pkg.service import process_payment\n\n"
+        "def test_process_payment():\n"
+        "    assert process_payment('valid-secret-token', 10.0) is True\n",
+        encoding="utf-8",
+    )
+
+    changed_line = deep_offset + 3
+    changed = [{"path": "pkg/service.py", "changed_lines": [changed_line], "additions": 2, "deletions": 0}]
+    index = build_structure_index(tmp_path, changed)
+
+    assert index["files_indexed"] >= 4
+    assert "pkg/service.py::process_payment" in index["symbol_by_id"]
+
+    ctx = build_agent_context(
+        role="security_agent",
+        workspace_dir=tmp_path,
+        structure_index=index,
+        changed_files=changed,
+        token_budget=2500,
+    )
+    assert ctx["fallback_used"] is False
+    assert ctx["token_estimate"] <= ctx["token_budget"]
+    assert "process_payment" in ctx["context_text"]
+    assert any(sl["file_path"] == "pkg/service.py" and sl["start_line"] > 350 for sl in ctx["selected_slices"])
+    assert "verify_token" in ctx["context_text"] or "handle_checkout" in ctx["context_text"]
+
+
+@pytest.mark.asyncio
+async def test_p2_incremental_cache_contract_and_invalidation(tmp_path: Path):
+    from app.cache.review_cache import ReviewCache, compute_cache_key, hash_config_dict
+    from app.scanners.style_tools import run_style_scanners
+
+    sample = tmp_path / "mod.py"
+    sample.write_text("def add(a: int, b: int) -> int:\n    return a + b\n", encoding="utf-8")
+
+    cache = ReviewCache(tmp_path / "_cache")
+    cfg1 = hash_config_dict({"strict": True})
+    cfg2 = hash_config_dict({"strict": False})
+
+    # 1. Cold run misses and populates cache
+    first = await run_style_scanners(
+        tmp_path, ["mod.py"], cache=cache, commit_context="c1..c2", config_hash=cfg1
+    )
+    assert first["cache_hit"] is False
+    assert cache.stats.writes == 1
+
+    # 2. Identical inputs -> deterministic cache hit
+    second = await run_style_scanners(
+        tmp_path, ["mod.py"], cache=cache, commit_context="c1..c2", config_hash=cfg1
+    )
+    assert second["cache_hit"] is True
+    assert cache.stats.hits >= 1
+
+    # 3. File content change -> cache miss (invalidation)
+    sample.write_text("import os\ndef add(a: int, b: int) -> int:\n    return a + b\n", encoding="utf-8")
+    third = await run_style_scanners(
+        tmp_path, ["mod.py"], cache=cache, commit_context="c1..c2", config_hash=cfg1
+    )
+    assert third["cache_hit"] is False
+
+    # 4. Configuration hash change -> cache miss
+    fourth = await run_style_scanners(
+        tmp_path, ["mod.py"], cache=cache, commit_context="c1..c2", config_hash=cfg2
+    )
+    assert fourth["cache_hit"] is False
+
+    # 5. Commit context change -> cache miss
+    fifth = await run_style_scanners(
+        tmp_path, ["mod.py"], cache=cache, commit_context="c2..c3", config_hash=cfg2
+    )
+    assert fifth["cache_hit"] is False
+
+    # 6. Tool version bump changes key deterministically
+    k1 = compute_cache_key(content_hash="abc", tool_version="v1", configuration_hash=cfg1, commit_context="c1")
+    k2 = compute_cache_key(content_hash="abc", tool_version="v2", configuration_hash=cfg1, commit_context="c1")
+    assert k1 != k2
+
+
+@pytest.mark.asyncio
+async def test_p3_central_review_planner_and_workflow_dispatch(tmp_path: Path):
+    from app.config import AGENT_METADATA
+    from app.orchestration.fanout_fanin import CoordinatorDispatcher
+    from app.orchestration.shared_state import AgentExecutionConfig
+    from app.planning.review_planner import build_review_plan
+    from app.scanners.security_tools import run_security_scanners
+    from app.scanners.style_tools import run_style_scanners
+    from app.scanners.test_tools import run_test_and_coverage
+
+    # 1. Docs-only diff -> low risk + selective skip_scanners (without Incomplete policy verdict)
+    docs_plan = build_review_plan(
+        changed_files=[{"path": "README.md", "additions": 12, "deletions": 2}],
+        diff_text="+# Updated docs\n",
+    )
+    assert docs_plan["risk_tier"] == "low"
+    assert docs_plan["docs_only"] is True
+    assert docs_plan["agent_plans"]["security_agent"]["skip_scanners"] is True
+
+    sec_skip = await run_security_scanners(
+        tmp_path, ["README.md"], plan=docs_plan["agent_plans"]["security_agent"]
+    )
+    style_skip = await run_style_scanners(
+        tmp_path, ["README.md"], plan=docs_plan["agent_plans"]["style_agent"]
+    )
+    test_skip = await run_test_and_coverage(
+        tmp_path, ["README.md"], plan=docs_plan["agent_plans"]["test_coverage_agent"]
+    )
+    assert sec_skip["bandit"]["status"] == "skipped_by_plan"
+    assert style_skip["ruff"]["status"] == "skipped_by_plan"
+    assert test_skip["status"] == "skipped_by_plan"
+
+    # 2. High-risk auth diff -> high tier + expanded security budget
+    auth_plan = build_review_plan(
+        changed_files=[{"path": "backend/auth/jwt_middleware.py", "additions": 35, "deletions": 8}],
+        diff_text="+subprocess.run(cmd, shell=True)\n+jwt.decode(tok)\n",
+    )
+    assert auth_plan["risk_tier"] == "high"
+    assert auth_plan["touches_auth_or_api"] is True
+    assert auth_plan["agent_plans"]["security_agent"]["token_budget"] > 5000
+
+    # 3. CoordinatorDispatcher populates STAIR structure_index, review_plan, and cache_stats
+    (tmp_path / "README.md").write_text("# Swarm Guide\n", encoding="utf-8")
+    events: list[tuple[str, str, dict[str, object]]] = []
+
+    async def _emit(rid: str, ev: str, payload: dict[str, object]) -> None:
+        events.append((rid, ev, payload))
+
+    class _CaptureExecutor(Executor):
+        def __init__(self) -> None:
+            super().__init__(id="capture")
+
+        @handler
+        async def capture(self, state: ReviewState, ctx: WorkflowContext[ReviewState, ReviewState]) -> None:
+            await ctx.yield_output(state)
+
+    dispatcher = CoordinatorDispatcher(_emit)
+    cap = _CaptureExecutor()
+    wf = WorkflowBuilder(start_executor=dispatcher).add_edge(dispatcher, cap).build()
+
+    configs = {
+        k: AgentExecutionConfig(
+            agent_name=k,
+            label=m["label"],
+            model=m["default_model"],
+            base_url="https://api.deepseek.com",
+            api_key="",
+        )
+        for k, m in AGENT_METADATA.items()
+    }
+    init_state = ReviewState(
+        review_id="rev-p3-dispatch",
+        repository_id="repo-1",
+        repository_name="demo/docs",
+        source_type="local",
+        base_commit="HEAD~1",
+        target_commit="HEAD",
+        workspace_dir=tmp_path,
+        diff_text="+# Swarm Guide\n",
+        changed_files=[{"path": "README.md", "status": "modified", "additions": 1, "deletions": 0}],
+        policy={},
+        agent_configs=configs,
+        cache_dir=tmp_path / "_cache",
+    )
+    out = (await wf.run(init_state)).get_outputs()[-1]
+    assert out.structure_index["files_indexed"] >= 1
+    assert out.review_plan["risk_tier"] == "low"
+    assert "writes" in out.cache_stats
+    assert any(ev == "fan_out_started" for _, ev, _ in events)
+
 
 
 

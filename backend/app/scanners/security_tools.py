@@ -5,12 +5,18 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from app.cache.review_cache import (
+    SCANNER_CACHE_SCHEMA_VERSION,
+    ReviewCache,
+    hash_files_content,
+    hash_text,
+)
 from app.scanners.code_engines import (
     is_test_fixture_hit,
     prioritize_repo_files,
     run_deterministic_code_guards,
 )
-from app.scanners.tool_runner import resolve_binary, run_command_capture
+from app.scanners.tool_runner import get_tool_version, resolve_binary, run_command_capture
 
 LOCAL_SEMGREP_RULES = Path(__file__).resolve().parent / "semgrep_rules.yml"
 
@@ -299,22 +305,116 @@ async def run_osv_scanner(workspace_dir: Path) -> dict[str, Any]:
     return {"status": "incomplete", "findings": findings, "error": res["stderr"][:500]}
 
 
+async def _skipped_by_plan_result(note: str) -> dict[str, Any]:
+    return {"status": "skipped_by_plan", "findings": [], "error": "", "note": note}
+
+
 async def run_security_scanners(
-    workspace_dir: Path, changed_file_paths: list[str]
+    workspace_dir: Path,
+    changed_file_paths: list[str],
+    *,
+    cache: ReviewCache | None = None,
+    commit_context: str = "HEAD",
+    config_hash: str = "default",
+    plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     import asyncio
 
+    if plan and plan.get("skip_scanners"):
+        note = "Skipped by ReviewPlanner (low-risk/docs-only change)"
+        skipped = await _skipped_by_plan_result(note)
+        return {
+            "bandit": dict(skipped),
+            "semgrep": dict(skipped),
+            "gitleaks": dict(skipped),
+            "osv_scanner": dict(skipped),
+            "deterministic_guards": dict(skipped),
+            "cache_hit": False,
+        }
+
+    manifest_names = {
+        "requirements.txt",
+        "pyproject.toml",
+        "poetry.lock",
+        "Pipfile.lock",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "go.mod",
+        "Cargo.lock",
+    }
+    cache_targets = list(changed_file_paths)
+    for mname in manifest_names:
+        if (workspace_dir / mname).is_file() and mname not in cache_targets:
+            cache_targets.append(mname)
+
+    content_hash = ""
+    tool_version = ""
+    if cache is not None and cache_targets:
+        content_hash = hash_files_content(workspace_dir, cache_targets)
+        vb, vs, vg, vo = await asyncio.gather(
+            get_tool_version("bandit"),
+            get_tool_version("semgrep"),
+            get_tool_version("gitleaks", ("version",)),
+            get_tool_version("osv-scanner"),
+        )
+        rules_digest = (
+            hash_text(LOCAL_SEMGREP_RULES.read_text(encoding="utf-8", errors="replace"))[:12]
+            if LOCAL_SEMGREP_RULES.exists()
+            else "norules"
+        )
+        plan_flags = hash_text(json.dumps(plan or {}, sort_keys=True, default=str))[:12]
+        tool_version = f"{SCANNER_CACHE_SCHEMA_VERSION}|b={vb}|s={vs}|g={vg}|o={vo}|r={rules_digest}|p={plan_flags}"
+        cached = cache.get(
+            "security_scanners",
+            content_hash=content_hash,
+            tool_version=tool_version,
+            configuration_hash=config_hash or "default",
+            commit_context=commit_context,
+        )
+        if isinstance(cached, dict):
+            return {**cached, "cache_hit": True}
+
+    run_bandit_flag = plan.get("run_bandit", True) if plan else True
+    run_semgrep_flag = plan.get("run_semgrep", True) if plan else True
+    run_gitleaks_flag = plan.get("run_gitleaks", True) if plan else True
+    run_osv_flag = plan.get("run_osv", True) if plan else True
+
     bandit_res, semgrep_res, gitleaks_res, osv_res, guards_res = await asyncio.gather(
-        run_bandit(workspace_dir, changed_file_paths),
-        run_semgrep(workspace_dir, changed_file_paths),
-        run_gitleaks(workspace_dir),
-        run_osv_scanner(workspace_dir),
+        run_bandit(workspace_dir, changed_file_paths)
+        if run_bandit_flag
+        else _skipped_by_plan_result("No Python changes in diff"),
+        run_semgrep(workspace_dir, changed_file_paths)
+        if run_semgrep_flag
+        else _skipped_by_plan_result("Skipped by ReviewPlanner"),
+        run_gitleaks(workspace_dir)
+        if run_gitleaks_flag
+        else _skipped_by_plan_result("Skipped by ReviewPlanner"),
+        run_osv_scanner(workspace_dir)
+        if run_osv_flag
+        else _skipped_by_plan_result("Skipped by ReviewPlanner"),
         run_deterministic_code_guards(workspace_dir, changed_file_paths),
     )
-    return {
+    payload = {
         "bandit": bandit_res,
         "semgrep": semgrep_res,
         "gitleaks": gitleaks_res,
         "osv_scanner": osv_res,
         "deterministic_guards": guards_res,
     }
+    cacheable_statuses = {"completed", "skipped_by_plan", "tool_unavailable"}
+    all_clean = all(
+        str(v.get("status", "")) in cacheable_statuses
+        for v in payload.values()
+        if isinstance(v, dict)
+    )
+    if cache is not None and cache_targets and all_clean:
+        cache.set(
+            "security_scanners",
+            content_hash=content_hash,
+            tool_version=tool_version,
+            configuration_hash=config_hash or "default",
+            commit_context=commit_context,
+            value=payload,
+        )
+    return {**payload, "cache_hit": False}

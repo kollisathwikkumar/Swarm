@@ -648,7 +648,19 @@ export default function ConsolidatedCodeReviewPage() {
                           className="w-full rounded-xl border border-border bg-muted/60 p-3 text-left transition hover:border-foreground/50"
                         >
                           <div className="flex flex-wrap items-center justify-between gap-1.5">
-                            <SeverityBadge severity={f.severity} />
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <SeverityBadge severity={f.severity} />
+                              {typeof f.confidence === "number" && (
+                                <span className="rounded border border-border bg-background px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+                                  {Math.round(f.confidence * 100)}% conf
+                                </span>
+                              )}
+                              {f.evidence_ids && f.evidence_ids.length > 0 && (
+                                <span className="rounded border border-border bg-background px-1.5 py-0.5 font-mono text-[10px] text-foreground">
+                                  {f.evidence_ids.join(", ")}
+                                </span>
+                              )}
+                            </div>
                             <VerificationBadge status={f.verification_status} />
                           </div>
                           <p className="mt-2 text-sm font-semibold">{f.title}</p>

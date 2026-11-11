@@ -10,14 +10,15 @@ from typing import Any
 from agent_framework import Executor, WorkflowContext, handler
 
 from app.agents.llm_factory import MissingAPIKeyError, run_structured_agent
+from app.intelligence.context_builder import build_agent_context
 from app.orchestration.cancellation import ReviewCancelledError, is_review_cancelled
 from app.orchestration.shared_state import (
     AgentExecutionOutput,
     ReviewState,
     StructuredFinding,
 )
-from app.scanners.code_engines import read_prioritized_workspace_files
 from app.scanners.git_diff_tool import collect_diff_context
+from app.skills.shared_contracts import format_agent_contract
 
 logger = logging.getLogger(__name__)
 
@@ -115,20 +116,26 @@ class DiffAgentExecutor(Executor):
                 "files": compact_files[:40],
                 "polyglot_symbols": diff_ctx.get("polyglot_symbols", {}),
             }
-            full_sources = read_prioritized_workspace_files(
-                state.workspace_dir,
-                [f.get("path", "") for f in compact_files if f.get("path")],
-                max_files=10,
-                max_total_chars=24000,
-                per_file_chars=12000,
+            agent_plan = (state.review_plan.get("agent_plans") or {}).get("diff_agent") or {}
+            stair_ctx = build_agent_context(
+                role="diff_agent",
+                workspace_dir=state.workspace_dir,
+                structure_index=state.structure_index,
+                changed_files=state.changed_files,
+                diff_text=state.diff_text,
+                target_files=agent_plan.get("focus_files"),
+                token_budget=agent_plan.get("token_budget"),
+                expand_for_high_risk=state.review_plan.get("risk_tier") == "high",
             )
-            truncated_diff = (state.diff_text or "")[:12000]
+            truncated_diff = (state.diff_text or "")[:10000]
+            contract_block = format_agent_contract("diff_agent", agent_plan)
             user_prompt = (
                 f"Repository: {state.repository_name}\n"
-                f"Base commit: {state.base_commit}\n"
-                f"Target commit: {state.target_commit}\n"
-                f"Changed files & Polyglot Symbols/Guards:\n{json.dumps(compact_ctx, indent=2)[:12000]}\n\n"
-                f"Line-Numbered Changed Source Files:\n{json.dumps(full_sources, indent=2)[:24000]}\n\n"
+                f"Base commit: {state.base_commit} | Target commit: {state.target_commit}\n"
+                f"Plan Risk Tier: {state.review_plan.get('risk_tier', 'medium')}\n\n"
+                f"{contract_block}\n\n"
+                f"Changed files & Polyglot Symbols/Guards:\n{json.dumps(compact_ctx, indent=2)[:8000]}\n\n"
+                f"{stair_ctx['context_text']}\n\n"
                 f"Unified Diff Excerpt:\n```diff\n{truncated_diff}\n```"
             )
             llm_out = await run_structured_agent(
@@ -138,6 +145,11 @@ class DiffAgentExecutor(Executor):
             diff_summary = str(llm_out.get("diff_summary") or "").strip()
             findings: list[StructuredFinding] = []
             for item in llm_out.get("findings", []) or []:
+                raw_conf = item.get("confidence", 0.55)
+                try:
+                    conf = max(0.0, min(1.0, float(raw_conf)))
+                except (TypeError, ValueError):
+                    conf = 0.55
                 findings.append(
                     StructuredFinding(
                         agent="Diff Agent",
@@ -152,6 +164,7 @@ class DiffAgentExecutor(Executor):
                         recommendation=str(item.get("recommendation") or ""),
                         verification_status="Needs Verification",
                         tool_name="git-diff",
+                        confidence=conf,
                     )
                 )
 

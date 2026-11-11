@@ -7,6 +7,7 @@ from sqlalchemy import (
     JSON,
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -191,6 +192,8 @@ class Finding(Base):
     deduplicated_sources: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     priority_rank: Mapped[int] = mapped_column(Integer, default=100, nullable=False)
     is_blocking: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    evidence_ids: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, default=0.5, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     review: Mapped[Review] = relationship(back_populates="findings")

@@ -4,6 +4,7 @@ import asyncio
 import difflib
 import json
 import logging
+import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -13,14 +14,21 @@ from agent_framework import Executor, WorkflowContext, handler
 
 from app.agents.llm_factory import MissingAPIKeyError, run_structured_agent
 from app.agents.reviewer_manager import _evaluate_review_policy
+from app.intelligence.context_builder import build_agent_context
 from app.orchestration.cancellation import ReviewCancelledError, is_review_cancelled
 from app.orchestration.shared_state import (
     AgentExecutionOutput,
     PatchProposal,
     ReviewState,
 )
-from app.scanners.code_engines import is_test_file_path, verify_code_syntax
+from app.scanners.code_engines import (
+    is_test_file_path,
+    run_deterministic_code_guards,
+    verify_code_syntax,
+)
 from app.services.git_workspace import resolve_within_dir, verify_patch_applicability
+from app.skills.shared_contracts import format_agent_contract
+from app.verification.evidence_guard import is_patch_eligible
 
 logger = logging.getLogger(__name__)
 
@@ -68,9 +76,13 @@ def _assemble_corrected_file(
 
 
 def _select_target_findings(
-    workspace_dir: Path, findings: list[dict[str, Any]], max_patches: int = 5
+    workspace_dir: Path,
+    findings: list[dict[str, Any]],
+    max_patches: int = 5,
+    *,
+    allow_unverified: bool = False,
 ) -> list[tuple[int, dict[str, Any]]]:
-    """Select top Verified/actionable source-file defects (skipping Unverified guesses and test-fixture alerts)."""
+    """Select top Verified, evidence-backed source-file defects strictly gated by EvidenceGuard."""
     sev_weight = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
     ranked: list[tuple[tuple[int, int, int, int], int, dict[str, Any]]] = []
 
@@ -81,9 +93,9 @@ def _select_target_findings(
         full = resolve_within_dir(workspace_dir, fp)
         if full is None or not full.exists() or not full.is_file() or full.stat().st_size > 250_000:
             continue
-        ver = str(f.get("verification_status") or "Needs Verification")
-        if ver == "Unverified":
+        if not is_patch_eligible(f, allow_unverified=allow_unverified):
             continue
+        ver = str(f.get("verification_status") or "Needs Verification")
         sev = str(f.get("severity") or "Medium")
         if sev not in ("Critical", "High", "Medium"):
             continue
@@ -148,8 +160,35 @@ async def _validate_patch_bundle(
 ) -> tuple[bool, bool, bool, str]:
     apply_ok, apply_msg = await verify_patch_applicability(workspace_dir, rel_path, unified_diff)
     syntax_ok, syntax_msg = await verify_code_syntax(rel_path, proposed_code, workspace_dir)
-    combined_ok = apply_ok and syntax_ok
-    validation_output = f"git apply --check: {apply_msg} | Syntax check: {syntax_msg}"
+
+    # Guard revalidation: ensure patch does not introduce any new Critical/High deterministic security guard alerts
+    guard_ok = True
+    guard_msg = "Security guard recheck passed"
+    before_guards = await run_deterministic_code_guards(workspace_dir, [rel_path])
+    before_rules = {
+        (f.get("rule_id"), f.get("severity"))
+        for f in (before_guards.get("findings") or [])
+        if f.get("severity") in ("Critical", "High")
+    }
+    with tempfile.TemporaryDirectory(prefix="swarm_patch_guard_") as tmp_dir:
+        tmp_ws = Path(tmp_dir)
+        tmp_file = resolve_within_dir(tmp_ws, rel_path)
+        if tmp_file is not None:
+            tmp_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp_file.write_text(proposed_code, encoding="utf-8")
+            after_guards = await run_deterministic_code_guards(tmp_ws, [rel_path])
+            new_high_risk = [
+                f
+                for f in (after_guards.get("findings") or [])
+                if f.get("severity") in ("Critical", "High")
+                and (f.get("rule_id"), f.get("severity")) not in before_rules
+            ]
+            if new_high_risk:
+                guard_ok = False
+                guard_msg = f"Introduced {len(new_high_risk)} new security guard issue(s): {new_high_risk[0].get('rule_id')}"
+
+    combined_ok = apply_ok and syntax_ok and guard_ok
+    validation_output = f"git apply --check: {apply_msg} | Syntax check: {syntax_msg} | {guard_msg}"
     return combined_ok, apply_ok, syntax_ok, validation_output
 
 
@@ -178,7 +217,13 @@ class FixSuggestionAgentExecutor(Executor):
             },
         )
 
-        targets = _select_target_findings(state.workspace_dir, state.findings, max_patches=5)
+        allow_unverified = bool((state.policy or {}).get("allow_unverified_patches", False))
+        targets = _select_target_findings(
+            state.workspace_dir,
+            state.findings,
+            max_patches=5,
+            allow_unverified=allow_unverified,
+        )
         if not targets:
             duration_ms = int((time.perf_counter() - t0) * 1000)
             state.agent_results["fix_suggestion_agent"] = AgentExecutionOutput(
@@ -186,7 +231,7 @@ class FixSuggestionAgentExecutor(Executor):
                 agent_label=cfg.label,
                 model_used=cfg.model,
                 status="completed",
-                summary="No actionable source-file findings required a generated patch.",
+                summary="No EvidenceGuard-Verified actionable source-file findings required a generated patch.",
                 duration_ms=duration_ms,
             ).to_dict()
             state.review_status = "completed"
@@ -242,12 +287,26 @@ class FixSuggestionAgentExecutor(Executor):
                     if contract_notes
                     else ""
                 )
+                fix_plan = (state.review_plan.get("agent_plans") or {}).get("fix_suggestion_agent") or {}
+                stair_ctx = build_agent_context(
+                    role="fix_suggestion_agent",
+                    workspace_dir=state.workspace_dir,
+                    structure_index=state.structure_index,
+                    changed_files=state.changed_files,
+                    diff_text=state.diff_text,
+                    findings=[finding],
+                    target_files=[rel_path],
+                    token_budget=fix_plan.get("token_budget"),
+                )
+                contract_block = format_agent_contract("fix_suggestion_agent", fix_plan)
 
                 user_prompt = (
-                    f"Target Finding:\n{json.dumps(finding, indent=2)}\n\n"
+                    f"{contract_block}\n\n"
+                    f"Target Verified Finding:\n{json.dumps(finding, indent=2)}\n\n"
                     f"File Path: {rel_path}\n"
                     f"Scope: {scope_label}\n"
                     f"{contract_section}\n"
+                    f"STAIR Dependency & Caller Context:\n{stair_ctx['context_text'][:6000]}\n\n"
                     f"Source Code to Fix (return the exact corrected replacement for this {scope_label}):\n"
                     f"```\n{target_snippet}\n```"
                 )

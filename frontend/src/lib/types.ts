@@ -77,6 +77,8 @@ export interface FindingItem {
   deduplicated_sources: string[];
   priority_rank: number;
   is_blocking: boolean;
+  evidence_ids?: string[];
+  confidence?: number;
 }
 
 export interface PatchSuggestionItem {

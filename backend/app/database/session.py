@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 
-from sqlalchemy import event
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -50,3 +50,14 @@ async def init_db() -> None:
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        if settings.database_url.startswith("sqlite"):
+            result = await conn.execute(text("PRAGMA table_info(findings)"))
+            cols = {row[1] for row in result.fetchall()}
+            if "evidence_ids" not in cols:
+                await conn.execute(
+                    text("ALTER TABLE findings ADD COLUMN evidence_ids JSON NOT NULL DEFAULT '[]'")
+                )
+            if "confidence" not in cols:
+                await conn.execute(
+                    text("ALTER TABLE findings ADD COLUMN confidence FLOAT NOT NULL DEFAULT 0.5")
+                )

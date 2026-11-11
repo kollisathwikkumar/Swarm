@@ -12,9 +12,9 @@ const LLM_PIPELINE = [
     phase: "Fan-Out (Parallel)",
     model: "deepseek-flash",
     inputs:
-      "Commit diff + prioritized complete files (up to 600 lines each) + extracted symbol/guard index (URL validation, auth parsing, DB locks).",
+      "Commit diff + STAIR hierarchical symbol/dependency slices (3,000-token budget) + AST changed-symbol & defensive-guard facts.",
     output:
-      "Explains behavioral impact across files and flags logical bugs or edge-case regressions anchored to exact line numbers.",
+      "Explains behavioral impact, semantic diffs, and API contract drift anchored to exact symbols, callers, and line numbers.",
   },
   {
     key: "style_agent",
@@ -22,9 +22,9 @@ const LLM_PIPELINE = [
     phase: "Fan-Out (Parallel)",
     model: "deepseek-flash",
     inputs:
-      "Ruff lints, Python AST complexity, Node TS syntax parse results, repeated dynamic imports, and detected >=6-line duplicate blocks.",
+      "Incremental cached Ruff lints, Python AST complexity, Node TS syntax parse results, duplicate blocks, and STAIR complexity slices (2,000-token budget).",
     output:
-      "Surfaces broken syntax, high-complexity modules, duplication, and maintainability defects backed by deterministic tool hits.",
+      "Surfaces broken syntax, high-complexity modules, duplication, and local refactoring fixes with honest confidence scores.",
   },
   {
     key: "security_agent",
@@ -32,9 +32,9 @@ const LLM_PIPELINE = [
     phase: "Fan-Out (Parallel)",
     model: "deepseek-v4-pro",
     inputs:
-      "Semgrep, Bandit, Gitleaks (tagging test-file fixtures cleanly), OSV-Scanner CVEs, deterministic auth/SSRF guards, and complete security-critical files.",
+      "Cached Semgrep, Bandit, Gitleaks, OSV-Scanner CVEs, SSRF/auth guards + STAIR caller/callee & guard slices (5,000-token budget, +30% on High Risk).",
     output:
-      "Identifies exploitable vulnerabilities, credential leaks, and SSRF gaps without misclassifying mock test strings as production leaks.",
+      "Audits source-to-sink paths and auth boundaries without falsely flagging guards implemented elsewhere in the module or test fixtures.",
   },
   {
     key: "test_coverage_agent",
@@ -42,29 +42,29 @@ const LLM_PIPELINE = [
     phase: "Fan-Out (Parallel)",
     model: "deepseek-flash",
     inputs:
-      "Pytest/Vitest execution results, Coverage.py lines, and the Cross-File Test-Import Map (direct and indirect test imports + skipIf flags).",
+      "Pytest/Vitest execution results, Coverage.py lines, Cross-File Test-Import Map, and STAIR linked test/symbol slices (3,500-token budget).",
     output:
-      "Reports real test failures or untested modules rather than guessing coverage from filenames alone.",
+      "Reports real test failures or untested changed symbols rather than guessing coverage from filenames alone.",
   },
   {
     key: "reviewer_manager",
     name: "5. Reviewer Manager",
-    phase: "Fan-In Verification",
+    phase: "Fan-In + EvidenceGuard",
     model: "deepseek-v4-pro",
     inputs:
-      "All 4 specialist outputs merged alongside a ground-truth index of actual disk files, line counts, syntax/SAST hits, and test-import maps.",
+      "All 4 specialist outputs + independent EvidenceGuard Store (EV-NNN provenance IDs) + STAIR verification slices (3,000-token budget, +30% on High Risk).",
     output:
-      "Deduplicates findings, blocks LLM-invented Verified tags, rejects contradicted false positives into rejected_false_positives, and computes the final verdict.",
+      "Blocks LLM self-certified Verified tags, enforces exact (file, tool/rule, line) attribution, rejects contradicted claims, and computes the verdict.",
   },
   {
     key: "fix_suggestion_agent",
     name: "6. Fix-Suggestion Agent",
-    phase: "Patch Synthesis",
+    phase: "Patch Validation",
     model: "deepseek-v4-pro",
     inputs:
-      "Top actionable finding + full edit window (up to 500 lines) + test assertions imported from covering unit tests.",
+      "Strictly EvidenceGuard-Verified defects (EV-NNN backed) + STAIR caller/dependency context (4,000-token budget) + covering test contracts.",
     output:
-      "Generates a unified diff verified by git apply --check and Python/Node syntax parsers (with automatic 1-shot self-repair on error). Human approval is always required.",
+      "Generates minimal unified diffs verified by git apply --check, syntax parsers, and security-guard regression checks. Human approval is always required.",
   },
 ];
 
@@ -75,8 +75,9 @@ export default function ArchitectureGuidePage() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">How the Models Work</h1>
           <p className="mt-1 max-w-3xl text-sm text-muted-foreground">
-            Deterministic scanners and AST parsers read full repository files first so DeepSeek Flash and V4 Pro
-            never guess from truncated diffs. Every finding and patch is verified against disk evidence before output.
+            Before Fan-Out starts, Swarm builds a STAIR hierarchical code/dependency index and classifies diff risk in
+            the Central Review Planner. LLMs never self-certify findings — EvidenceGuard verifies every tool citation
+            and source line independently.
           </p>
         </div>
         <Link

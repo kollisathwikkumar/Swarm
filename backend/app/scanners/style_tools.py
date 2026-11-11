@@ -6,8 +6,13 @@ import json
 from pathlib import Path
 from typing import Any
 
+from app.cache.review_cache import (
+    SCANNER_CACHE_SCHEMA_VERSION,
+    ReviewCache,
+    hash_files_content,
+)
 from app.scanners.code_engines import prioritize_repo_files, verify_code_syntax
-from app.scanners.tool_runner import resolve_binary, run_command_capture
+from app.scanners.tool_runner import get_tool_version, resolve_binary, run_command_capture
 
 
 def _analyze_code_style_and_duplicates(
@@ -166,13 +171,52 @@ def _analyze_code_style_and_duplicates(
 
 
 async def run_style_scanners(
-    workspace_dir: Path, changed_file_paths: list[str]
+    workspace_dir: Path,
+    changed_file_paths: list[str],
+    *,
+    cache: ReviewCache | None = None,
+    commit_context: str = "HEAD",
+    config_hash: str = "default",
+    plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if plan and plan.get("skip_scanners"):
+        return {
+            "ruff": {
+                "status": "skipped_by_plan",
+                "error": "",
+                "findings": [],
+                "note": "Skipped by ReviewPlanner (low-risk/docs-only change)",
+            },
+            "ast_checks": {
+                "status": "skipped_by_plan",
+                "findings": [],
+                "note": "Skipped by ReviewPlanner (low-risk/docs-only change)",
+            },
+            "cache_hit": False,
+        }
+
     existing_targets = [
         rel
         for rel in changed_file_paths
         if (workspace_dir / rel).exists() and (workspace_dir / rel).is_file()
     ]
+
+    content_hash = ""
+    tool_version = ""
+    if cache is not None and existing_targets:
+        content_hash = hash_files_content(workspace_dir, existing_targets)
+        ruff_ver = await get_tool_version("ruff")
+        tool_version = f"{SCANNER_CACHE_SCHEMA_VERSION}|ruff={ruff_ver}"
+        cached = cache.get(
+            "style_scanners",
+            content_hash=content_hash,
+            tool_version=tool_version,
+            configuration_hash=config_hash or "default",
+            commit_context=commit_context,
+        )
+        if isinstance(cached, dict):
+            return {**cached, "cache_hit": True}
+
     ruff_bin = resolve_binary("ruff")
     ruff_findings: list[dict[str, Any]] = []
     ruff_status = "completed"
@@ -186,7 +230,10 @@ async def run_style_scanners(
             if ".git" not in p.parts and ".venv" not in p.parts
         ][:50]
 
-    if ruff_bin and py_targets:
+    run_ruff_flag = plan.get("run_ruff", True) if plan else True
+    if not run_ruff_flag and not py_targets:
+        ruff_status = "skipped_by_plan"
+    elif ruff_bin and py_targets:
         res = await run_command_capture(
             [ruff_bin, "check", "--output-format", "json", "--no-fix", *py_targets],
             cwd=workspace_dir,
@@ -253,7 +300,7 @@ async def run_style_scanners(
                         }
                     )
 
-    return {
+    payload = {
         "ruff": {
             "status": ruff_status,
             "error": ruff_error,
@@ -264,3 +311,18 @@ async def run_style_scanners(
             "findings": ast_res["complexity_and_style"] + ast_res["duplicates"],
         },
     }
+    if cache is not None and existing_targets and ruff_status in (
+        "completed",
+        "skipped_no_python_files",
+        "skipped_by_plan",
+        "tool_unavailable",
+    ):
+        cache.set(
+            "style_scanners",
+            content_hash=content_hash,
+            tool_version=tool_version,
+            configuration_hash=config_hash or "default",
+            commit_context=commit_context,
+            value=payload,
+        )
+    return {**payload, "cache_hit": False}

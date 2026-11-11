@@ -74,6 +74,28 @@ async def run_command_capture(
     }
 
 
+_TOOL_VERSION_CACHE: dict[str, str] = {}
+
+
+async def get_tool_version(name: str, args: tuple[str, ...] = ("--version",)) -> str:
+    """Return a cached single-line version string for deterministic scanner cache keys."""
+    if name in _TOOL_VERSION_CACHE:
+        return _TOOL_VERSION_CACHE[name]
+    bin_path = resolve_binary(name)
+    if not bin_path:
+        _TOOL_VERSION_CACHE[name] = "missing"
+        return "missing"
+    res = await run_command_capture(
+        [bin_path, *args],
+        cwd=Path(tempfile.gettempdir()),
+        timeout=8,
+    )
+    first_line = next((ln.strip() for ln in (res["stdout"] or res["stderr"] or "").splitlines() if ln.strip()), "unknown")
+    ver = first_line[:120]
+    _TOOL_VERSION_CACHE[name] = ver
+    return ver
+
+
 async def check_installed_scanners() -> dict[str, dict[str, Any]]:
     tools = ["git", "semgrep", "gitleaks", "bandit", "osv-scanner", "ruff", "pytest", "coverage", "node"]
     status: dict[str, dict[str, Any]] = {}

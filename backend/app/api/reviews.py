@@ -505,6 +505,8 @@ async def get_review_detail(
                 "deduplicated_sources": f.deduplicated_sources,
                 "priority_rank": f.priority_rank,
                 "is_blocking": f.is_blocking,
+                "evidence_ids": f.evidence_ids,
+                "confidence": f.confidence,
             }
             for f in findings
         ],

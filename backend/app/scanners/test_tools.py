@@ -205,7 +205,24 @@ async def run_test_and_coverage(
     changed_file_paths: list[str],
     *,
     enable_execution: bool = True,
+    plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if plan and plan.get("skip_scanners"):
+        return {
+            "status": "skipped_by_plan",
+            "runner": "skipped_by_plan",
+            "tests_found": 0,
+            "test_files": [],
+            "js_test_files": [],
+            "test_import_map": {},
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "total_coverage_percent": None,
+            "file_coverage": {},
+            "output": "Test execution skipped by ReviewPlanner (low-risk/docs-only change).",
+        }
+
     discovered = discover_test_files(workspace_dir)
     py_tests = discovered["python"]
     js_tests = discovered["js_ts"]

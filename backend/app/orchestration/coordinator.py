@@ -159,10 +159,14 @@ def _build_markdown_report(review: Review, repo: Repository, state: ReviewState)
     if not state.findings:
         lines.append("No findings reported.")
     for idx, f in enumerate(state.findings, start=1):
+        ev_ids = f.get("evidence_ids") or []
+        ev_label = f" | **Evidence IDs:** {', '.join(ev_ids)}" if ev_ids else ""
+        conf_val = f.get("confidence")
+        conf_label = f" | **Confidence:** {int(round(float(conf_val) * 100))}%" if isinstance(conf_val, (int, float)) else ""
         lines.extend(
             [
-                f"### {idx}. [{f.get('severity')}] {f.get('title')} ({f.get('verification_status')})",
-                f"- **Location:** `{f.get('file_path')}:{f.get('line_number') or 1}`",
+                f"### {idx}. [{f.get('severity')}] {f.get('title')} ({f.get('verification_status')}{conf_label})",
+                f"- **Location:** `{f.get('file_path')}:{f.get('line_number') or 1}`{ev_label}",
                 f"- **Sources:** {', '.join(f.get('deduplicated_sources') or [f.get('agent', 'Agent')])}",
                 f"- **Evidence:** `{f.get('evidence', '')[:240]}`",
                 f"- **Recommendation:** {f.get('recommendation', '')}",
@@ -274,6 +278,7 @@ class ReviewCoordinator:
                     changed_files=list(code_change.changed_files or []),
                     policy=policy,
                     agent_configs=agent_configs,
+                    cache_dir=get_settings().resolved_workspace_dir / "_cache",
                 )
 
                 async def emit_and_persist(rid: str, event_type: str, payload: dict[str, Any]) -> None:
@@ -378,6 +383,8 @@ class ReviewCoordinator:
                         deduplicated_sources=list(f.get("deduplicated_sources") or []),
                         priority_rank=int(f.get("priority_rank") or 100),
                         is_blocking=bool(f.get("is_blocking", False)),
+                        evidence_ids=list(f.get("evidence_ids") or []),
+                        confidence=float(f.get("confidence", 0.5)),
                     )
                     db.add(finding_row)
                     persisted_findings.append(finding_row)
