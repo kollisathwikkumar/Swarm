@@ -88,6 +88,11 @@ export interface PatchSuggestionItem {
   repository_name?: string;
   source_type?: string;
   finding_id?: string | null;
+  finding_severity?: string;
+  finding_title?: string;
+  finding_rule_id?: string | null;
+  finding_tool_name?: string | null;
+  finding_evidence?: string | null;
   file_path: string;
   title: string;
   original_code: string;

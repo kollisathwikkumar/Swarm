@@ -9,7 +9,7 @@ from typing import Any
 
 from agent_framework import Executor, WorkflowContext, handler
 
-from app.agents.llm_factory import MissingAPIKeyError, run_structured_agent
+from app.agents.llm_factory import LLM_FALLBACK_EXCEPTIONS, MissingAPIKeyError, run_structured_agent
 from app.intelligence.context_builder import build_agent_context
 from app.orchestration.cancellation import ReviewCancelledError, is_review_cancelled
 from app.orchestration.shared_state import AgentExecutionOutput, ReviewState
@@ -190,7 +190,7 @@ def _evaluate_review_policy(
         None,
     )
     test_tr = (_agent_field(test_agent, "tool_results") or {}) if test_agent else {}
-    tests_failed = int(test_tr.get("failed", 0))
+    tests_failed = int(test_tr.get("failed") or 0)
 
     blocking_reasons: list[str] = []
     for f in findings:
@@ -276,38 +276,58 @@ class ReviewerManagerExecutor(Executor):
             for f in res.findings:
                 all_raw_findings.append(f.to_dict())
 
-        # Surface deterministic scanner findings directly if an analysis agent failed/missed API key
-        # or if security_agent didn't forward deterministic_guards hits
+        # Surface deterministic scanner findings cleanly regardless of specialist status
         existing_sig = {
             (str(f.get("file_path") or ""), int(f.get("line_number") or 0), str(f.get("rule_id") or ""))
             for f in all_raw_findings
         }
+        existing_tool_sig = {
+            (str(f.get("file_path") or ""), int(f.get("line_number") or 0), str(f.get("tool_name") or ""))
+            for f in all_raw_findings
+        }
+
+        def _append_det_if_new(candidate: dict[str, Any]) -> None:
+            fp_c = str(candidate.get("file_path") or "")
+            ln_c = int(candidate.get("line_number") or 0)
+            rid_c = str(candidate.get("rule_id") or "")
+            t_c = str(candidate.get("tool_name") or "")
+            sig1 = (fp_c, ln_c, rid_c)
+            sig2 = (fp_c, ln_c, t_c)
+            if (rid_c and sig1 in existing_sig) or (not rid_c and t_c and sig2 in existing_tool_sig):
+                return
+            if rid_c:
+                existing_sig.add(sig1)
+            if t_c:
+                existing_tool_sig.add(sig2)
+            all_raw_findings.append(candidate)
+
         for res in results:
             tr = res.tool_results or {}
             if res.agent_name == "diff_agent":
                 for item in (tr.get("ast_diff") or {}).get("findings", []) or []:
-                    sig = (str(item.get("file_path") or ""), int(item.get("line_number") or 0), str(item.get("rule_id") or ""))
-                    if sig not in existing_sig:
-                        existing_sig.add(sig)
-                        all_raw_findings.append(
-                            {
-                                "agent": "Diff Agent",
-                                "category": "change_risk",
-                                "severity": item.get("severity", "Medium"),
-                                "title": item.get("title", "API Contract Change"),
-                                "description": item.get("evidence", ""),
-                                "file_path": item.get("file_path", ""),
-                                "line_number": item.get("line_number"),
-                                "end_line": None,
-                                "evidence": item.get("evidence", ""),
-                                "recommendation": "Verify downstream callers match the updated signature or interface.",
-                                "verification_status": "Verified",
-                                "tool_name": item.get("tool", "diff-ast-engine"),
-                                "rule_id": item.get("rule_id"),
-                            }
-                        )
+                    _append_det_if_new(
+                        {
+                            "agent": "Diff Agent",
+                            "category": "change_risk",
+                            "severity": item.get("severity", "Medium"),
+                            "title": item.get("title", "API Contract Change"),
+                            "description": item.get("evidence", ""),
+                            "file_path": item.get("file_path", ""),
+                            "line_number": item.get("line_number"),
+                            "end_line": None,
+                            "evidence": item.get("evidence", ""),
+                            "recommendation": "Verify downstream callers match the updated signature or interface.",
+                            "verification_status": "Verified",
+                            "tool_name": item.get("tool", "diff-ast-engine"),
+                            "rule_id": item.get("rule_id"),
+                        }
+                    )
             elif res.agent_name == "security_agent":
                 for sec_key, def_tool in (
+                    ("bandit", "bandit"),
+                    ("semgrep", "semgrep"),
+                    ("gitleaks", "gitleaks"),
+                    ("osv_scanner", "osv-scanner"),
                     ("deterministic_guards", "security-guard"),
                     ("taint_analysis", "security-taint"),
                     ("codeql", "codeql"),
@@ -315,90 +335,43 @@ class ReviewerManagerExecutor(Executor):
                 ):
                     guard_items = (tr.get(sec_key) or {}).get("findings", []) or []
                     for item in guard_items:
-                        sig = (str(item.get("file_path") or ""), int(item.get("line_number") or 0), str(item.get("rule_id") or ""))
-                        if sig not in existing_sig:
-                            existing_sig.add(sig)
-                            all_raw_findings.append(
-                                {
-                                    "agent": "Security Agent",
-                                    "category": "security",
-                                    "severity": item.get("severity", "Medium"),
-                                    "title": item.get("title", "Deterministic Security Finding"),
-                                    "description": item.get("description", ""),
-                                    "file_path": item.get("file_path", ""),
-                                    "line_number": item.get("line_number"),
-                                    "end_line": None,
-                                    "evidence": item.get("evidence", ""),
-                                    "recommendation": item.get("description", "Remediate detected vulnerability."),
-                                    "verification_status": "Verified",
-                                    "tool_name": item.get("tool", def_tool),
-                                    "rule_id": item.get("rule_id"),
-                                }
-                            )
+                        _append_det_if_new(
+                            {
+                                "agent": "Security Agent",
+                                "category": "security",
+                                "severity": item.get("severity", "High" if sec_key in ("bandit", "semgrep", "gitleaks", "osv_scanner") else "Medium"),
+                                "title": item.get("title", "Deterministic Security Finding"),
+                                "description": item.get("description", ""),
+                                "file_path": item.get("file_path", ""),
+                                "line_number": item.get("line_number"),
+                                "end_line": item.get("end_line"),
+                                "evidence": item.get("evidence", ""),
+                                "recommendation": item.get("description", "Remediate detected security vulnerability."),
+                                "verification_status": "Verified",
+                                "tool_name": item.get("tool", def_tool),
+                                "rule_id": item.get("rule_id"),
+                            }
+                        )
             elif res.agent_name == "style_agent":
-                for style_key in ("eslint", "pylint", "dead_code"):
+                for style_key in ("ruff", "eslint", "pylint", "dead_code", "ast_checks"):
                     for item in (tr.get(style_key) or {}).get("findings", []) or []:
-                        sig = (str(item.get("file_path") or ""), int(item.get("line_number") or 0), str(item.get("rule_id") or ""))
-                        if sig not in existing_sig:
-                            existing_sig.add(sig)
-                            all_raw_findings.append(
-                                {
-                                    "agent": "Style Agent",
-                                    "category": "code_quality",
-                                    "severity": item.get("severity", "Low"),
-                                    "title": f"{item.get('rule_id', 'STYLE')}: {str(item.get('message', ''))[:80]}",
-                                    "description": item.get("message", ""),
-                                    "file_path": item.get("file_path", ""),
-                                    "line_number": item.get("line_number"),
-                                    "end_line": item.get("end_line"),
-                                    "evidence": item.get("message", ""),
-                                    "recommendation": "Resolve linter or dead-code violation.",
-                                    "verification_status": "Verified",
-                                    "tool_name": item.get("tool", style_key.replace("_", "-")),
-                                    "rule_id": item.get("rule_id"),
-                                }
-                            )
-            if res.status in ("incomplete", "failed") and tr:
-                if res.agent_name == "security_agent":
-                    for tool_key in ("bandit", "semgrep", "gitleaks", "osv_scanner"):
-                        for item in (tr.get(tool_key) or {}).get("findings", []):
-                            all_raw_findings.append(
-                                {
-                                    "agent": "Security Agent",
-                                    "category": "security",
-                                    "severity": item.get("severity", "High"),
-                                    "title": item.get("title", "Deterministic Security Finding"),
-                                    "description": item.get("description", ""),
-                                    "file_path": item.get("file_path", ""),
-                                    "line_number": item.get("line_number"),
-                                    "end_line": item.get("end_line"),
-                                    "evidence": item.get("evidence", ""),
-                                    "recommendation": "Remediate detected security issue.",
-                                    "verification_status": "Verified",
-                                    "tool_name": item.get("tool", tool_key),
-                                    "rule_id": item.get("rule_id"),
-                                }
-                            )
-                elif res.agent_name == "style_agent":
-                    for section in ("ruff", "ast_checks"):
-                        for item in (tr.get(section) or {}).get("findings", []):
-                            all_raw_findings.append(
-                                {
-                                    "agent": "Style Agent",
-                                    "category": "code_quality",
-                                    "severity": item.get("severity", "Low"),
-                                    "title": item.get("rule_id", "Style Violation"),
-                                    "description": item.get("message", ""),
-                                    "file_path": item.get("file_path", ""),
-                                    "line_number": item.get("line_number"),
-                                    "end_line": item.get("end_line"),
-                                    "evidence": item.get("message", ""),
-                                    "recommendation": "Fix code style/complexity issue.",
-                                    "verification_status": "Verified",
-                                    "tool_name": item.get("tool", "ruff"),
-                                    "rule_id": item.get("rule_id"),
-                                }
-                            )
+                        _append_det_if_new(
+                            {
+                                "agent": "Style Agent",
+                                "category": "code_quality",
+                                "severity": item.get("severity", "Low"),
+                                "title": f"{item.get('rule_id', 'STYLE')}: {str(item.get('message', ''))[:80]}",
+                                "description": item.get("message", ""),
+                                "file_path": item.get("file_path", ""),
+                                "line_number": item.get("line_number"),
+                                "end_line": item.get("end_line"),
+                                "evidence": item.get("message", ""),
+                                "recommendation": "Resolve linter, complexity, or dead-code violation.",
+                                "verification_status": "Verified",
+                                "tool_name": item.get("tool", style_key.replace("_", "-")),
+                                "rule_id": item.get("rule_id"),
+                            }
+                        )
             if res.agent_name == "test_coverage_agent" and int(tr.get("failed") or 0) > 0:
                 failed_cnt = int(tr.get("failed") or 0)
                 runner_name = str(tr.get("runner") or "pytest")
@@ -486,117 +459,254 @@ class ReviewerManagerExecutor(Executor):
 
         test_suites = ((extras.get("test_import_map") or {}).get("test_suites") or {}).keys()
         manager_plan = (state.review_plan.get("agent_plans") or {}).get("reviewer_manager") or {}
-        stair_ctx = build_agent_context(
-            role="reviewer_manager",
-            workspace_dir=state.workspace_dir,
-            structure_index=state.structure_index,
-            changed_files=state.changed_files,
-            diff_text=state.diff_text,
-            evidence_items=state.evidence_store,
-            findings=verified_raw,
-            target_files=list(dict.fromkeys(referenced_files + list(test_suites))),
-            token_budget=manager_plan.get("token_budget"),
-            expand_for_high_risk=state.review_plan.get("risk_tier") == "high",
+        fanout_clean = all(r.status == "completed" for r in results)
+        skip_manager_llm = bool(
+            cfg.api_key.strip()
+            and fanout_clean
+            and len(verified_raw) == 0
+            and len(evidence_records) == 0
+            and (state.review_plan.get("docs_only") or state.review_plan.get("risk_tier") == "low")
         )
-        contract_block = format_agent_contract("reviewer_manager", manager_plan)
 
         consolidated: list[dict[str, Any]] = []
         rejected_llm: list[dict[str, Any]] = []
         manager_summary = ""
         manager_status = "completed"
         manager_error: str | None = None
+        llm_degraded_reason: str | None = None
         manager_raw: dict[str, Any] = {}
+        token_usage: dict[str, int] | None = None
+        stair_ctx: dict[str, Any] = {
+            "token_estimate": 0,
+            "fallback_used": False,
+            "selected_slices": [],
+        }
 
-        try:
-            if is_review_cancelled(state.review_id):
-                raise ReviewCancelledError("Review stopped by user.")
-            user_prompt = (
-                f"Repository: {state.repository_name}\n"
-                f"Plan Risk Tier: {state.review_plan.get('risk_tier', 'medium')}\n"
-                f"Diff Summary: {state.diff_summary[:2000]}\n"
-                f"Agent Execution Statuses: {json.dumps({r.agent_name: r.status for r in results})}\n\n"
-                f"{contract_block}\n\n"
-                f"Immutable EvidenceStore ({len(state.evidence_store)} records):\n"
-                f"{json.dumps(state.evidence_store[:60], indent=2)[:8000]}\n\n"
-                f"Polyglot Symbols & Guards (across complete files):\n"
-                f"{json.dumps(extras['polyglot_symbols'], indent=2)[:6000]}\n\n"
-                f"Cross-File Test-Import Coverage Map:\n"
-                f"{json.dumps(extras['test_import_map'], indent=2)[:6000]}\n\n"
-                f"{stair_ctx['context_text']}\n\n"
-                f"Candidate Findings ({len(verified_raw)}):\n"
-                f"{json.dumps(verified_raw, indent=2)[:14000]}"
+        _DET_STYLE_TOOLS = {
+            "ruff",
+            "eslint",
+            "pylint",
+            "dead-code",
+            "ast-style-checker",
+            "dead_code",
+            "ast_checks",
+        }
+        contradiction_titles = {
+            str(c.get("finding_title") or "").strip().lower()
+            for c in contradictions
+            if isinstance(c, dict)
+        }
+        passthrough_verified: list[dict[str, Any]] = []
+        adjudication_candidates: list[dict[str, Any]] = []
+        for item in verified_raw:
+            t_low = str(item.get("tool_name") or "").lower()
+            title_low = str(item.get("title") or "").strip().lower()
+            is_trivial_verified_style = (
+                item.get("verification_status") == "Verified"
+                and item.get("category") == "code_quality"
+                and str(item.get("severity") or "Low").title() == "Low"
+                and t_low in _DET_STYLE_TOOLS
+                and title_low not in contradiction_titles
             )
-            manager_raw = await run_structured_agent(
-                cfg, system_prompt=SYSTEM_PROMPT, user_prompt=user_prompt, timeout_seconds=95.0
-            )
-            manager_summary = str(manager_raw.get("executive_summary") or "").strip()
-            rejected_llm = list(manager_raw.get("rejected_false_positives") or [])
+            if is_trivial_verified_style:
+                passthrough_verified.append(item)
+            else:
+                adjudication_candidates.append(item)
 
-            for idx, item in enumerate(manager_raw.get("consolidated_findings", []) or [], start=1):
-                noise_reason = check_finding_contradiction(item, extras)
-                if noise_reason:
-                    rejected_auto.append(
-                        {"title": item.get("title", ""), "file_path": item.get("file_path", ""), "reason": noise_reason}
+        adjudication_candidates.sort(
+            key=lambda x: (
+                0 if x.get("verification_status") == "Needs Verification" else 1,
+                SEVERITY_ORDER.get(str(x.get("severity") or "Low").title(), 3),
+                int(x.get("priority_rank") or 999),
+            )
+        )
+        adjudication_prompt_items = adjudication_candidates[:35]
+
+        if skip_manager_llm:
+            manager_summary = (
+                f"All 4 specialist agents completed cleanly with 0 candidate findings on a "
+                f"{state.review_plan.get('risk_tier', 'low')}-risk change; Reviewer Manager LLM skipped (token saver)."
+            )
+            manager_raw = {"executive_summary": manager_summary, "llm_skipped_token_saver": True}
+        else:
+            adj_files = [
+                str(f.get("file_path") or "").strip()
+                for f in adjudication_prompt_items
+                if f.get("file_path")
+            ]
+            stair_budget = min(2200, int(manager_plan.get("token_budget") or 2200))
+            has_unverified_adj = any(
+                f.get("verification_status") == "Needs Verification" for f in adjudication_prompt_items
+            )
+            stair_ctx = build_agent_context(
+                role="reviewer_manager",
+                workspace_dir=state.workspace_dir,
+                structure_index=state.structure_index,
+                changed_files=state.changed_files,
+                diff_text=state.diff_text,
+                evidence_items=state.evidence_store[:45],
+                findings=adjudication_prompt_items,
+                target_files=list(dict.fromkeys(adj_files + list(test_suites))) or list(dict.fromkeys(referenced_files + list(test_suites))),
+                token_budget=stair_budget,
+                expand_for_high_risk=bool(has_unverified_adj and state.review_plan.get("risk_tier") == "high"),
+            )
+            contract_block = format_agent_contract("reviewer_manager", manager_plan)
+            relevant_files_set = set(adj_files or referenced_files) | {
+                str(c.get("path") or "") for c in state.changed_files if c.get("path")
+            }
+            scoped_polyglot = {
+                k: v for k, v in (extras.get("polyglot_symbols") or {}).items() if k in relevant_files_set
+            } or (extras.get("polyglot_symbols") or {})
+            has_testing_claims = any(f.get("category") == "testing" for f in adjudication_prompt_items)
+            raw_tmap = extras.get("test_import_map") or {}
+            scoped_tmap = (
+                raw_tmap
+                if has_testing_claims
+                else {"source_file_test_map": raw_tmap.get("source_file_test_map") or {}}
+            )
+            adj_ev_ids = {
+                eid for c in adjudication_prompt_items for eid in (c.get("evidence_ids") or [])
+            }
+            prompt_evidence = [
+                rec for rec in state.evidence_store if rec.get("evidence_id") in adj_ev_ids
+            ][:45] or state.evidence_store[:35]
+
+            try:
+                if is_review_cancelled(state.review_id):
+                    raise ReviewCancelledError("Review stopped by user.")
+                user_prompt = (
+                    f"Repository: {state.repository_name}\n"
+                    f"Plan Risk Tier: {state.review_plan.get('risk_tier', 'medium')} | Auto-Passed Low Lints: {len(passthrough_verified)}\n"
+                    f"Diff Summary: {state.diff_summary[:1800]}\n"
+                    f"Agent Execution Statuses: {json.dumps({r.agent_name: r.status for r in results}, separators=(',', ':'))}\n\n"
+                    f"{contract_block}\n\n"
+                    f"Immutable EvidenceStore ({len(prompt_evidence)} of {len(state.evidence_store)} records):\n"
+                    f"{json.dumps(prompt_evidence, separators=(',', ':'))[:6000]}\n\n"
+                    f"Polyglot Symbols & Guards (across complete files):\n"
+                    f"{json.dumps(scoped_polyglot, separators=(',', ':'))[:4500]}\n\n"
+                    f"Cross-File Test-Import Coverage Map:\n"
+                    f"{json.dumps(scoped_tmap, separators=(',', ':'))[:4000]}\n\n"
+                    f"{stair_ctx['context_text']}\n\n"
+                    f"Adjudication Candidates ({len(adjudication_prompt_items)} of {len(verified_raw)} total):\n"
+                    f"{json.dumps(adjudication_prompt_items, separators=(',', ':'))[:10000]}"
+                )
+                manager_raw = await run_structured_agent(
+                    cfg,
+                    system_prompt=SYSTEM_PROMPT,
+                    user_prompt=user_prompt,
+                    timeout_seconds=105.0,
+                    max_tokens=2200,
+                )
+                token_usage = manager_raw.pop("_token_usage", None)
+                manager_summary = str(manager_raw.get("executive_summary") or "").strip()
+                rejected_llm = list(manager_raw.get("rejected_false_positives") or [])
+
+                for idx, item in enumerate(manager_raw.get("consolidated_findings", []) or [], start=1):
+                    noise_reason = check_finding_contradiction(item, extras)
+                    if noise_reason:
+                        rejected_auto.append(
+                            {"title": item.get("title", ""), "file_path": item.get("file_path", ""), "reason": noise_reason}
+                        )
+                        continue
+
+                    # Force EvidenceGuard provenance verification + permission check regardless of what LLM claims
+                    guarded_item, fabricated = verify_finding_provenance(
+                        item,
+                        evidence_records,
+                        state.workspace_dir,
+                        execution_telemetry=extras.get("test_telemetry"),
                     )
-                    continue
+                    if fabricated:
+                        fabricated_claims += 1
 
-                # Force EvidenceGuard provenance verification + permission check regardless of what LLM claims
-                guarded_item, fabricated = verify_finding_provenance(
-                    item,
-                    evidence_records,
-                    state.workspace_dir,
-                    execution_telemetry=extras.get("test_telemetry"),
-                )
-                if fabricated:
-                    fabricated_claims += 1
+                    fp = str(guarded_item.get("file_path") or "").strip()
+                    ln = guarded_item.get("line_number")
+                    if guarded_item.get("tool_name") == "gitleaks" and is_test_fixture_hit(
+                        state.workspace_dir, fp, ln, str(guarded_item.get("evidence") or "")
+                    ):
+                        guarded_item["is_test_fixture"] = True
+                    sev = normalize_severity_with_criteria(guarded_item)
 
-                fp = str(guarded_item.get("file_path") or "").strip()
-                ln = guarded_item.get("line_number")
-                if guarded_item.get("tool_name") == "gitleaks" and is_test_fixture_hit(
-                    state.workspace_dir, fp, ln, str(guarded_item.get("evidence") or "")
-                ):
-                    guarded_item["is_test_fixture"] = True
-                sev = normalize_severity_with_criteria(guarded_item)
+                    consolidated.append(
+                        {
+                            "agent": str(guarded_item.get("agent") or "Reviewer Manager"),
+                            "category": str(guarded_item.get("category") or "general"),
+                            "severity": sev,
+                            "title": str(guarded_item.get("title") or "Finding"),
+                            "description": str(guarded_item.get("description") or ""),
+                            "file_path": fp,
+                            "line_number": ln,
+                            "end_line": guarded_item.get("end_line"),
+                            "evidence": str(guarded_item.get("evidence") or ""),
+                            "tool_name": guarded_item.get("tool_name"),
+                            "rule_id": guarded_item.get("rule_id"),
+                            "recommendation": str(guarded_item.get("recommendation") or ""),
+                            "verification_status": guarded_item["verification_status"],
+                            "evidence_ids": list(guarded_item.get("evidence_ids") or []),
+                            "confidence": float(guarded_item.get("confidence", 0.5)),
+                            "deduplicated_sources": list(
+                                guarded_item.get("deduplicated_sources")
+                                or [guarded_item.get("agent") or "Reviewer Manager"]
+                            ),
+                            "priority_rank": int(guarded_item.get("priority_rank") or idx),
+                        }
+                    )
 
-                consolidated.append(
-                    {
-                        "agent": str(guarded_item.get("agent") or "Reviewer Manager"),
-                        "category": str(guarded_item.get("category") or "general"),
-                        "severity": sev,
-                        "title": str(guarded_item.get("title") or "Finding"),
-                        "description": str(guarded_item.get("description") or ""),
-                        "file_path": fp,
-                        "line_number": ln,
-                        "end_line": guarded_item.get("end_line"),
-                        "evidence": str(guarded_item.get("evidence") or ""),
-                        "tool_name": guarded_item.get("tool_name"),
-                        "rule_id": guarded_item.get("rule_id"),
-                        "recommendation": str(guarded_item.get("recommendation") or ""),
-                        "verification_status": guarded_item["verification_status"],
-                        "evidence_ids": list(guarded_item.get("evidence_ids") or []),
-                        "confidence": float(guarded_item.get("confidence", 0.5)),
-                        "deduplicated_sources": list(
-                            guarded_item.get("deduplicated_sources")
-                            or [guarded_item.get("agent") or "Reviewer Manager"]
-                        ),
-                        "priority_rank": int(guarded_item.get("priority_rank") or idx),
-                    }
-                )
-            if not consolidated and verified_raw and not rejected_llm:
+                # Never let LLM truncation/omission silently drop Verified deterministic EV-NNN findings (including passthrough Low style hits)
+                covered_ev_ids = {
+                    eid for cf in consolidated for eid in (cf.get("evidence_ids") or [])
+                }
+                rejected_sigs = {
+                    (str(r.get("file_path") or "").strip(), str(r.get("title") or "").strip().lower())
+                    for r in rejected_llm
+                }
+                for vf in verified_raw:
+                    if vf.get("verification_status") != "Verified":
+                        continue
+                    vf_evs = list(vf.get("evidence_ids") or [])
+                    if any(eid in covered_ev_ids for eid in vf_evs):
+                        continue
+                    vf_sig = (str(vf.get("file_path") or "").strip(), str(vf.get("title") or "").strip().lower())
+                    if vf_sig in rejected_sigs:
+                        continue
+                    consolidated.append(dict(vf))
+                    covered_ev_ids.update(vf_evs)
+
+                if not consolidated and verified_raw and not rejected_llm:
+                    consolidated = _deterministic_deduplicate(verified_raw)
+                else:
+                    consolidated = _deterministic_deduplicate(consolidated)
+                    consolidated.sort(
+                        key=lambda x: (
+                            0 if x.get("verification_status") == "Verified" else 1,
+                            SEVERITY_ORDER.get(str(x.get("severity") or "Low").title(), 3),
+                            int(x.get("priority_rank") or 999),
+                        )
+                    )
+                    for rank_idx, cf in enumerate(consolidated, start=1):
+                        cf["priority_rank"] = rank_idx
+            except (ReviewCancelledError, asyncio.CancelledError):
+                raise
+            except MissingAPIKeyError as exc:
+                manager_status = "completed"
+                manager_error = None
+                llm_degraded_reason = str(exc)
                 consolidated = _deterministic_deduplicate(verified_raw)
-        except (ReviewCancelledError, asyncio.CancelledError):
-            raise
-        except MissingAPIKeyError as exc:
-            manager_status = "incomplete"
-            manager_error = str(exc)
-            consolidated = _deterministic_deduplicate(verified_raw)
-            manager_summary = "Reviewer Manager LLM API key is missing; deterministic consolidation applied."
-        except Exception as exc:
-            logger.exception("Reviewer Manager LLM failed")
-            manager_status = "failed"
-            manager_error = str(exc)
-            consolidated = _deterministic_deduplicate(verified_raw)
-            manager_summary = f"Reviewer Manager LLM error: {exc}"
+                manager_summary = (
+                    f"EvidenceGuard deterministically verified & consolidated {len(consolidated)} finding(s); "
+                    "LLM adjudication bypassed (offline/no API key mode)."
+                )
+            except LLM_FALLBACK_EXCEPTIONS as exc:
+                err_reason = str(exc) or type(exc).__name__
+                logger.warning("Reviewer Manager LLM fallback to deterministic consolidation: %s", err_reason)
+                llm_degraded_reason = err_reason
+                manager_status = "completed"
+                manager_error = None
+                consolidated = _deterministic_deduplicate(verified_raw)
+                manager_summary = (
+                    f"EvidenceGuard deterministically verified & consolidated {len(consolidated)} finding(s); "
+                    f"LLM adjudication fell back cleanly ({err_reason[:110]})."
+                )
 
         all_rejected = rejected_auto + rejected_llm
         all_outputs_for_policy = results + [
@@ -616,6 +726,27 @@ class ReviewerManagerExecutor(Executor):
         state.recommendation = recommendation
         state.recommendation_reason = reason
 
+        rm_tool_results: dict[str, Any] = {
+            "consolidated_count": len(evaluated_findings),
+            "verified_count": len([f for f in evaluated_findings if f.get("verification_status") == "Verified"]),
+            "rejected_false_positives_count": len(all_rejected),
+            "rejected_false_positives": all_rejected[:20],
+            "evidence_store_count": len(evidence_records),
+            "fabricated_tool_claims_count": fabricated_claims,
+            "cross_agent_contradictions_count": len(contradictions),
+            "cross_agent_contradictions": contradictions[:15],
+            "stair_context_tokens": stair_ctx["token_estimate"],
+            "stair_fallback_used": stair_ctx["fallback_used"],
+            "adjudicated_candidates_count": len(adjudication_prompt_items),
+            "passthrough_verified_count": len(passthrough_verified),
+            "llm_skipped_token_saver": skip_manager_llm,
+            "recommendation": recommendation,
+        }
+        if token_usage:
+            rm_tool_results["token_usage"] = token_usage
+        if llm_degraded_reason:
+            rm_tool_results["llm_degraded"] = {"reason": llm_degraded_reason, "fallback": "evidence_guard_deterministic"}
+
         duration_ms = int((time.perf_counter() - t0) * 1000)
         state.agent_results["reviewer_manager"] = AgentExecutionOutput(
             agent_name="reviewer_manager",
@@ -623,18 +754,7 @@ class ReviewerManagerExecutor(Executor):
             model_used=cfg.model,
             status=manager_status,
             summary=manager_summary or reason,
-            tool_results={
-                "consolidated_count": len(evaluated_findings),
-                "rejected_false_positives_count": len(all_rejected),
-                "rejected_false_positives": all_rejected[:20],
-                "evidence_store_count": len(evidence_records),
-                "fabricated_tool_claims_count": fabricated_claims,
-                "cross_agent_contradictions_count": len(contradictions),
-                "cross_agent_contradictions": contradictions[:15],
-                "stair_context_tokens": stair_ctx["token_estimate"],
-                "stair_fallback_used": stair_ctx["fallback_used"],
-                "recommendation": recommendation,
-            },
+            tool_results=rm_tool_results,
             raw_output=manager_raw,
             error_message=manager_error,
             duration_ms=duration_ms,
@@ -653,6 +773,7 @@ class ReviewerManagerExecutor(Executor):
                 "findings_count": len(evaluated_findings),
                 "rejected_false_positives": len(all_rejected),
                 "summary": manager_summary or reason,
+                "tool_results": rm_tool_results,
             },
         )
         await ctx.send_message(state)

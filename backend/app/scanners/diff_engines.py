@@ -29,7 +29,32 @@ _TS_SIG_RE = re.compile(
 
 
 class _VarNormalizer(ast.NodeTransformer):
-    """Normalize local variable identifiers so variable-only renames produce matching AST fingerprints."""
+    """Normalize local variable identifiers and strip docstrings so variable/doc edits produce matching AST fingerprints."""
+
+    def _strip_docstring(self, body: list[ast.stmt]) -> list[ast.stmt]:
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            return body[1:]
+        return body
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
+        self.generic_visit(node)
+        node.body = self._strip_docstring(node.body)
+        return node
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AST:
+        self.generic_visit(node)
+        node.body = self._strip_docstring(node.body)
+        return node
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> ast.AST:
+        self.generic_visit(node)
+        node.body = self._strip_docstring(node.body)
+        return node
 
     def visit_Name(self, node: ast.Name) -> ast.AST:
         return ast.copy_location(ast.Name(id="_VAR", ctx=node.ctx), node)
@@ -131,7 +156,9 @@ def _extract_ts_symbol_map(src: str) -> dict[str, dict[str, Any]]:
 async def _read_base_file(workspace_dir: Path, base_commit: str, rel_path: str) -> str | None:
     if not (workspace_dir / ".git").exists():
         return None
-    if not base_commit or base_commit in ("HEAD", "WORKING_TREE", "EMPTY_TREE"):
+    if base_commit == "EMPTY_TREE":
+        return None
+    if not base_commit or base_commit in ("HEAD", "WORKING_TREE"):
         ref = "HEAD"
     else:
         try:
@@ -265,7 +292,9 @@ async def analyze_ast_and_contract_diff(
                 changed_line_set
                 and any(t_info["line"] <= ln <= t_info["end_line"] for ln in changed_line_set)
             )
-            if base_src is not None and name not in base_syms:
+            if (base_src is not None and name not in base_syms) or (
+                base_commit == "EMPTY_TREE" or ch.get("status") == "added"
+            ):
                 semantic_counts["added_symbols"] += 1
                 ast_symbol_changes.append(
                     {

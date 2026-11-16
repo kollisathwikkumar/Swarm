@@ -38,7 +38,11 @@ from app.orchestration.cancellation import (
 from app.orchestration.fanout_fanin import build_review_workflow
 from app.orchestration.shared_state import AgentExecutionConfig, ReviewState
 from app.services.crypto import decrypt_secret
-from app.services.git_workspace import prepare_review_workspace
+from app.services.git_workspace import (
+    is_excluded_path,
+    prepare_review_workspace,
+    resolve_within_dir,
+)
 from app.services.websocket_manager import ws_manager
 
 logger = logging.getLogger(__name__)
@@ -143,21 +147,50 @@ async def _load_policy(db: AsyncSession) -> dict[str, Any]:
 
 
 def _build_markdown_report(review: Review, repo: Repository, state: ReviewState) -> str:
+    crit_count = sum(1 for f in state.findings if str(f.get("severity")).title() == "Critical")
+    high_count = sum(1 for f in state.findings if str(f.get("severity")).title() == "High")
+    med_count = sum(1 for f in state.findings if str(f.get("severity")).title() == "Medium")
+    low_count = sum(1 for f in state.findings if str(f.get("severity")).title() == "Low")
+    verified_count = sum(1 for f in state.findings if str(f.get("verification_status")).title() == "Verified")
+
     lines = [
-        "# Swarm Automated Code Review Report",
+        "# 🛡️ Swarm Multi-Agent Code Review & Remediation Report",
+        "",
+        "## Executive Summary & Audit Scorecard",
         f"- **Repository:** `{repo.full_name}` ({repo.source_type})",
         f"- **Review ID:** `{review.id}`",
-        f"- **Commits:** `{review.base_commit[:12]}` -> `{review.target_commit[:12]}`",
-        f"- **Recommendation:** **{state.recommendation}**",
-        f"- **Reason:** {state.recommendation_reason}",
+        f"- **Commit Range:** `{review.base_commit[:12]}` → `{review.target_commit[:12]}`",
+        f"- **Verdict:** **{state.recommendation}**",
+        f"- **Verdict Reason:** {state.recommendation_reason}",
         "",
-        "## Diff Summary",
-        state.diff_summary or "No summary produced.",
+        "| Metric | Count | Status Description |",
+        "|---|---|---|",
+        f"| **Critical Blockers** | `{crit_count}` | Exploit-reachable security flaws, backdoors, or broken syntax |",
+        f"| **High Risk** | `{high_count}` | Severe behavioral regressions, unconstrained I/O, or taint leaks |",
+        f"| **Medium Issues** | `{med_count}` | Maintainability, missing guards, or test coverage deficits |",
+        f"| **Low / Informational** | `{low_count}` | Style issues, cosmetic findings, or benign test fixtures |",
+        f"| **Verified Evidence** | `{verified_count}` | Findings with exact deterministic tool & line provenance |",
+        f"| **Automated Patches** | `{len(state.patch_proposals)}` | Sandbox-tested minimal patches with regression tests |",
+        "",
+        "## 🧭 Prioritized Remediation Roadmap",
+    ]
+
+    if not state.findings:
+        lines.append("✅ All code changes cleared mandatory security, style, and regression audits with 0 blocking defects.")
+    else:
+        lines.append("Follow this prioritized sequence to remediate identified defects cleanly:")
+        for idx, f in enumerate(state.findings[:5], start=1):
+            sev = f.get("severity", "Medium")
+            lines.append(f"{idx}. **[{sev}] `{f.get('title')}`** in `{f.get('file_path')}:{f.get('line_number') or 1}` — {f.get('recommendation')}")
+        lines.append("")
+
+    lines.extend([
+        "## Diff Summary & Architectural Impact",
+        state.diff_summary or "No architectural diff summary produced.",
         "",
         f"## Consolidated Findings ({len(state.findings)})",
-    ]
-    if not state.findings:
-        lines.append("No findings reported.")
+    ])
+
     for idx, f in enumerate(state.findings, start=1):
         ev_ids = f.get("evidence_ids") or []
         ev_label = f" | **Evidence IDs:** {', '.join(ev_ids)}" if ev_ids else ""
@@ -173,24 +206,35 @@ def _build_markdown_report(review: Review, repo: Repository, state: ReviewState)
                 "",
             ]
         )
+
     if state.patch_proposals:
-        lines.append(f"## Proposed Fixes ({len(state.patch_proposals)})")
-        for p in state.patch_proposals:
+        lines.append(f"## 🛠️ Sandbox-Validated Fix Suggestions & Resolution Paths ({len(state.patch_proposals)})")
+        for idx, p in enumerate(state.patch_proposals, start=1):
             lines.extend(
                 [
-                    f"### {p.get('title')} (`{p.get('file_path')}`)",
-                    f"- **Patch & Syntax Validation:** {'Verified' if p.get('applicability_verified') else 'Needs review'} ({p.get('validation_output', '')})",
-                    f"- **Explanation:** {p.get('explanation')}",
+                    f"### Fix {idx}: {p.get('title')} (`{p.get('file_path')}`)",
+                    f"- **Verification Proof:** {'Verified' if p.get('applicability_verified') else 'Needs review'} ({p.get('validation_output', '')})",
+                    f"- **Root Cause & Rationale:** {p.get('explanation')}",
+                    "",
+                    "**POSIX Unified Patch:**",
                     "```diff",
                     p.get("unified_diff", ""),
                     "```",
                     "",
+                    "**Direct CLI Application Workflow:**",
+                    "```bash",
+                    f"# Apply patch to working tree",
+                    f"git apply << 'EOF'\n{p.get('unified_diff', '')}\nEOF",
+                    "```",
+                    "",
                 ]
             )
+
     rm_tr = (state.agent_results.get("reviewer_manager") or {}).get("tool_results") or {}
     rejected_fps = rm_tr.get("rejected_false_positives") or []
     if rejected_fps:
-        lines.append(f"## Filtered False Positives ({len(rejected_fps)})")
+        lines.append(f"## 🛡️ Filtered False Positives ({len(rejected_fps)})")
+        lines.append("The following claims were contradicted by ground-truth repository AST guards and eliminated by the Adversarial Fan-In Verifier:")
         for rfp in rejected_fps[:10]:
             lines.append(f"- **Rejected:** `{rfp.get('title')}` (`{rfp.get('file_path') or 'repo'}`) — {rfp.get('reason')}")
         lines.append("")
@@ -266,6 +310,26 @@ class ReviewCoordinator:
                     excluded_patterns=policy.get("excluded_paths", []),
                 )
 
+                existing_snaps = dict(code_change.file_snapshots or {})
+                excluded_pats = policy.get("excluded_paths", [])
+                snaps_updated = False
+                for ch in (code_change.changed_files or []):
+                    if len(existing_snaps) >= 40:
+                        break
+                    fp = str(ch.get("path") or "").strip()
+                    if not fp or fp in existing_snaps or is_excluded_path(fp, excluded_pats):
+                        continue
+                    target_f = resolve_within_dir(workspace_dir, fp)
+                    if target_f is not None and target_f.is_file() and target_f.stat().st_size <= 120_000:
+                        try:
+                            existing_snaps[fp] = target_f.read_text(encoding="utf-8", errors="replace")
+                            snaps_updated = True
+                        except OSError:
+                            continue
+                if snaps_updated:
+                    code_change.file_snapshots = existing_snaps
+                    await db.commit()
+
                 initial_state = ReviewState(
                     review_id=review_id,
                     repository_id=repo.id,
@@ -318,6 +382,8 @@ class ReviewCoordinator:
                                         ar.summary = str(payload["reason"])
                                     if payload.get("duration_ms") is not None:
                                         ar.duration_ms = int(payload["duration_ms"])
+                                    if isinstance(payload.get("tool_results"), dict):
+                                        ar.tool_results = payload["tool_results"]
                                     ar.completed_at = datetime.now(UTC)
                                 elif event_type == "agent_failed":
                                     ar.status = str(payload.get("status") or "failed")
@@ -325,13 +391,15 @@ class ReviewCoordinator:
                                         ar.error_message = str(payload["error"])
                                     if payload.get("duration_ms") is not None:
                                         ar.duration_ms = int(payload["duration_ms"])
+                                    if isinstance(payload.get("tool_results"), dict):
+                                        ar.tool_results = payload["tool_results"]
                                     ar.completed_at = datetime.now(UTC)
                                 await ev_db.commit()
                     except SQLAlchemyError as exc:
                         logger.debug("Ignoring telemetry persistence error for %s: %s", rid, exc)
 
                 workflow = build_review_workflow(emit_and_persist)
-                wf_result = await asyncio.wait_for(workflow.run(initial_state), timeout=240.0)
+                wf_result = await asyncio.wait_for(workflow.run(initial_state), timeout=600.0)
                 if is_review_cancelled(review_id):
                     raise ReviewCancelledError("Stopped by user")
                 outputs = wf_result.get_outputs()
@@ -510,16 +578,29 @@ class ReviewCoordinator:
                         logger.debug("Rollback on late error failed for %s: %s", review_id, rb_exc)
                     await asyncio.shield(persist_review_stopped(review_id))
                     return
-                logger.exception("Review execution error for %s", review_id)
+                err_detail = str(exc) or type(exc).__name__
+                logger.exception("Review execution error for %s: %s", review_id, err_detail)
                 review.review_status = "failed"
                 review.recommendation = "Incomplete"
-                review.recommendation_reason = f"Review execution error: {exc}"
+                review.recommendation_reason = f"Review execution error: {err_detail}"
                 review.completed_at = datetime.now(UTC)
+                stale_runs = (
+                    await db.execute(
+                        select(AgentRun).where(
+                            AgentRun.review_id == review_id,
+                            AgentRun.status.in_(["queued", "running"]),
+                        )
+                    )
+                ).scalars().all()
+                for stale_ar in stale_runs:
+                    stale_ar.status = "incomplete"
+                    stale_ar.error_message = stale_ar.error_message or err_detail
+                    stale_ar.completed_at = datetime.now(UTC)
                 await db.commit()
                 await ws_manager.emit(
                     review_id,
                     "review_failed",
-                    {"error": str(exc)},
+                    {"error": err_detail},
                 )
             finally:
                 review_id_var.reset(ctx_token)

@@ -138,6 +138,8 @@ def build_review_plan(
         "minimal_reproduction",
     ]
 
+    code_focus_files = [p for p in changed_paths if not _is_doc_or_asset(p)][:10] or changed_paths[:10]
+
     agent_plans: dict[str, dict[str, Any]] = {
         "diff_agent": {
             "mode": "deep" if high_risk else ("light" if docs_only else "standard"),
@@ -145,7 +147,7 @@ def build_review_plan(
             "focus_skills": diff_skills,
             "permissions": AGENT_CAPABILITY_REGISTRY["diff_agent"].to_dict(),
             "skip_scanners": False,
-            "focus_files": changed_paths[:10],
+            "focus_files": code_focus_files,
         },
         "style_agent": {
             "mode": "light" if skip_heavy_scanners else "standard",
@@ -172,7 +174,7 @@ def build_review_plan(
             "run_taint": not skip_heavy_scanners,
             "run_codeql": high_risk and not skip_heavy_scanners,
             "run_trivy": (high_risk or touches_deps) and not skip_heavy_scanners,
-            "focus_files": changed_paths[:10],
+            "focus_files": code_focus_files,
         },
         "test_coverage_agent": {
             "mode": "light" if skip_heavy_scanners else ("deep" if high_risk else "standard"),
@@ -182,11 +184,11 @@ def build_review_plan(
             "skip_scanners": skip_heavy_scanners,
             "selective_test_mode": not high_risk and not touches_deps,
             "require_tests_pass": bool((policy or {}).get("require_tests_pass", True)),
-            "focus_files": changed_paths[:10],
+            "focus_files": code_focus_files,
         },
         "reviewer_manager": {
             "mode": "deep" if high_risk else "standard",
-            "token_budget": int(AGENT_TOKEN_BUDGETS["reviewer_manager"] * (1.3 if high_risk else 1.0)),
+            "token_budget": AGENT_TOKEN_BUDGETS["reviewer_manager"],
             "focus_skills": list(AGENT_CAPABILITY_REGISTRY["reviewer_manager"].skills),
             "permissions": AGENT_CAPABILITY_REGISTRY["reviewer_manager"].to_dict(),
         },

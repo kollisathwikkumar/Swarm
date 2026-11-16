@@ -118,9 +118,10 @@ async def list_patches(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     stmt = (
-        select(PatchSuggestion, Review, Repository)
+        select(PatchSuggestion, Review, Repository, Finding)
         .join(Review, PatchSuggestion.review_id == Review.id)
         .join(Repository, Review.repository_id == Repository.id)
+        .outerjoin(Finding, PatchSuggestion.finding_id == Finding.id)
         .where(Repository.user_id == user.id)
         .order_by(PatchSuggestion.created_at.desc())
     )
@@ -139,6 +140,11 @@ async def list_patches(
                 "repository_name": repo.full_name,
                 "source_type": repo.source_type,
                 "finding_id": p.finding_id,
+                "finding_severity": f.severity if f else "High",
+                "finding_title": f.title if f else p.title,
+                "finding_rule_id": f.rule_id if f else None,
+                "finding_tool_name": f.tool_name if f else None,
+                "finding_evidence": f.evidence if f else None,
                 "file_path": p.file_path,
                 "title": p.title,
                 "original_code": p.original_code,
@@ -154,7 +160,7 @@ async def list_patches(
                 "decided_at": p.decided_at.isoformat() if p.decided_at else None,
                 "created_at": p.created_at.isoformat() if p.created_at else None,
             }
-            for p, rev, repo in rows
+            for p, rev, repo, f in rows
         ]
     }
 

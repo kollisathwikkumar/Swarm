@@ -49,6 +49,9 @@ def _analyze_python_security(rel_path: str, src: str) -> tuple[list[dict[str, An
         return findings, surfaces
 
     has_path_sanitizer_in_file = bool(_PATH_SANITIZER_RE.search(src))
+    has_router_auth = bool(
+        re.search(r"APIRouter\s*\([^)]*dependencies\s*=\s*\[[^\]]*Depends\s*\(", src, re.DOTALL)
+    )
 
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -68,7 +71,7 @@ def _analyze_python_security(rel_path: str, src: str) -> tuple[list[dict[str, An
                     tainted.add(arg.arg)
             is_mutating = bool(re.search(r"\b(?:router|app|bp)\.(?:post|put|patch|delete)\s*\(", dec_joined))
             is_public = bool(_PUBLIC_ROUTE_RE.search(dec_joined))
-            if is_mutating and not is_public and not _AUTH_GUARD_RE.search(dec_joined + "\n" + fn_src):
+            if is_mutating and not is_public and not has_router_auth and not _AUTH_GUARD_RE.search(dec_joined + "\n" + fn_src):
                 surfaces.add("auth_and_sessions")
                 findings.append(
                     {
@@ -104,7 +107,11 @@ def _analyze_python_security(rel_path: str, src: str) -> tuple[list[dict[str, An
             if isinstance(call.func, ast.Attribute) and call.func.attr in ("execute", "executemany") and call.args:
                 surfaces.add("sql_or_db")
                 sql_arg = call.args[0]
-                if _is_dynamic_sql_expr(sql_arg) and "SELECT" in (ast.get_source_segment(src, sql_arg) or "").upper() or (
+                sql_seg = ast.get_source_segment(src, sql_arg) or ""
+                if (
+                    _is_dynamic_sql_expr(sql_arg)
+                    and re.search(r"\b(?:SELECT|INSERT|UPDATE|DELETE)\b", sql_seg, re.IGNORECASE)
+                ) or (
                     _is_dynamic_sql_expr(sql_arg) and _node_contains_name(sql_arg, tainted)
                 ):
                     t_var = _node_contains_name(sql_arg, tainted) or "interpolated expression"
@@ -220,6 +227,95 @@ def _analyze_python_security(rel_path: str, src: str) -> tuple[list[dict[str, An
                     }
                 )
 
+            # 5. Obfuscated backdoor execution
+            if fn_name in ("eval", "exec") and call.args:
+                arg0 = ast.get_source_segment(src, call.args[0]) or ""
+                if any(obf in arg0 for obf in ("b64decode", "bytes.fromhex", "decompress", "rot13", "unhexlify", "getattr")):
+                    surfaces.add("backdoors")
+                    findings.append(
+                        {
+                            "tool": "security-taint",
+                            "rule_id": "BACKDOOR-OBFUSCATED-EXECUTION",
+                            "file_path": rel_path,
+                            "line_number": call_line,
+                            "severity": "Critical",
+                            "title": "Obfuscated payload execution backdoor pattern",
+                            "evidence": f"`{call_txt}` decompresses/decodes payload into dynamic execution",
+                            "description": "Decoding and executing obfuscated binary or encoded text is a classic backdoor delivery mechanism.",
+                        }
+                    )
+
+            # 6. Reverse shell / interactive shell socket
+            if (
+                fn_name in ("pty.spawn", "os.dup2")
+                or ("socket.connect" in call_txt and any(sh in fn_src for sh in ("/bin/sh", "/bin/bash", "cmd.exe")))
+            ):
+                surfaces.add("backdoors")
+                findings.append(
+                    {
+                        "tool": "security-taint",
+                        "rule_id": "BACKDOOR-REVERSE-SHELL",
+                        "file_path": rel_path,
+                        "line_number": call_line,
+                        "severity": "Critical",
+                        "title": "Reverse shell / interactive shell socket detected",
+                        "evidence": call_txt,
+                        "description": "Spawning an interactive shell attached to file descriptors or network sockets is an active backdoor indicator.",
+                    }
+                )
+
+            # 7. Data breach / sensitive logging
+            if fn_name in ("print", "logger.info", "logger.debug", "logger.warning", "logger.error", "logging.info", "logging.debug", "logging.error") and call.args:
+                arg_text = " ".join(ast.get_source_segment(src, a) or "" for a in call.args)
+                if re.search(r"\b(?:password|token|secret|api_key|credential|private_key|auth_header)\b", arg_text, re.IGNORECASE):
+                    surfaces.add("data_exposure")
+                    findings.append(
+                        {
+                            "tool": "security-taint",
+                            "rule_id": "DATA-BREACH-SENSITIVE-LOGGING",
+                            "file_path": rel_path,
+                            "line_number": call_line,
+                            "severity": "High",
+                            "title": "Credential or sensitive token logged to output stream",
+                            "evidence": call_txt,
+                            "description": "Logging plaintext secrets, passwords, or tokens leaks confidential data into logs, causing compliance violations and breach risks.",
+                        }
+                    )
+
+            # 8. SSRF targeting Cloud Metadata
+            if fn_name in ("requests.get", "requests.post", "httpx.get", "httpx.post", "urllib.request.urlopen") and call.args:
+                arg0 = ast.get_source_segment(src, call.args[0]) or ""
+                if "169.254.169.254" in arg0 or "metadata.google.internal" in arg0:
+                    surfaces.add("ssrf_metadata")
+                    findings.append(
+                        {
+                            "tool": "security-taint",
+                            "rule_id": "SSRF-CLOUD-METADATA",
+                            "file_path": rel_path,
+                            "line_number": call_line,
+                            "severity": "Critical",
+                            "title": "Direct HTTP request to Cloud Metadata instance endpoint",
+                            "evidence": call_txt,
+                            "description": "Hardcoded or unconstrained requests to 169.254.169.254 / metadata.google.internal allow instance role credential theft via SSRF.",
+                        }
+                    )
+
+            # 9. Zip Slip in archive extraction
+            if fn_name.endswith(".extractall") or fn_name in ("zipfile.extractall", "tarfile.extractall"):
+                surfaces.add("file_system_io")
+                findings.append(
+                    {
+                        "tool": "security-taint",
+                        "rule_id": "PATH-TRAVERSAL-ZIP-SLIP",
+                        "file_path": rel_path,
+                        "line_number": call_line,
+                        "severity": "High",
+                        "title": "Unvalidated archive extraction (Zip Slip risk)",
+                        "evidence": call_txt,
+                        "description": "Calling extractall() without validating that member filenames do not contain path traversal sequences ('../') can overwrite system files.",
+                    }
+                )
+
     return findings, surfaces
 
 
@@ -274,6 +370,48 @@ def _analyze_ts_js_security(rel_path: str, src: str) -> tuple[list[dict[str, Any
                     "description": "Untrusted request properties flow directly into template SQL execution.",
                 }
             )
+        if re.search(r"\beval\s*\(\s*(?:atob|Buffer\.from)\b", ln):
+            surfaces.add("backdoors")
+            findings.append(
+                {
+                    "tool": "security-taint",
+                    "rule_id": "BACKDOOR-OBFUSCATED-EXECUTION",
+                    "file_path": rel_path,
+                    "line_number": idx,
+                    "severity": "Critical",
+                    "title": "Obfuscated base64 payload evaluated dynamically",
+                    "evidence": stripped[:220],
+                    "description": "Dynamic evaluation of base64 decoded strings is a common indicator of backdoor activity.",
+                }
+            )
+        if re.search(r"child_process\.(?:exec|spawn)\s*\([^)]*`[^`]*\$\{", ln):
+            surfaces.add("command_or_eval")
+            findings.append(
+                {
+                    "tool": "security-taint",
+                    "rule_id": "TAINT-CMD-INJECTION",
+                    "file_path": rel_path,
+                    "line_number": idx,
+                    "severity": "Critical",
+                    "title": "Command injection via interpolated shell execution",
+                    "evidence": stripped[:220],
+                    "description": "Untrusted template variable flows directly into child_process execution.",
+                }
+            )
+        if re.search(r"console\.(?:log|info|warn|error)\([^)]*\b(?:password|token|secret|apiKey|accessToken)\b", ln, re.IGNORECASE):
+            surfaces.add("data_exposure")
+            findings.append(
+                {
+                    "tool": "security-taint",
+                    "rule_id": "DATA-BREACH-SENSITIVE-LOGGING",
+                    "file_path": rel_path,
+                    "line_number": idx,
+                    "severity": "High",
+                    "title": "Credential or auth token logged to console output",
+                    "evidence": stripped[:220],
+                    "description": "Logging plaintext credentials or tokens causes leakage in production telemetry and audit logs.",
+                }
+            )
     return findings, surfaces
 
 
@@ -290,7 +428,7 @@ def run_taint_and_threat_analysis(
         rel
         for rel in prioritize_repo_files(target_files)
         if not is_test_file_path(rel)
-    ][:30]
+    ][:120]
 
     findings: list[dict[str, Any]] = []
     threat_surfaces: set[str] = set()

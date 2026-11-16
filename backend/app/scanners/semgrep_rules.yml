@@ -118,3 +118,136 @@ rules:
     severity: WARNING
     metadata:
       cwe: CWE-79
+
+  # --- Real-World Backdoor & Malicious Pattern Detection ---
+  - id: python-backdoor-obfuscated-exec
+    pattern-either:
+      - pattern: 'eval(base64.b64decode(...))'
+      - pattern: 'exec(base64.b64decode(...))'
+      - pattern: 'eval(zlib.decompress(...))'
+      - pattern: 'exec(zlib.decompress(...))'
+      - pattern: 'eval(bytes.fromhex(...))'
+      - pattern: 'exec(bytes.fromhex(...))'
+      - pattern: 'exec(codecs.decode(..., "rot13"))'
+    message: Obfuscated dynamic code execution detected. This is a common pattern in backdoor payloads and malicious implants.
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: CWE-94
+      impact: CRITICAL
+      confidence: HIGH
+
+  - id: python-backdoor-reverse-shell
+    pattern-either:
+      - pattern: 'pty.spawn("/bin/sh")'
+      - pattern: 'pty.spawn("/bin/bash")'
+      - pattern: 'os.dup2($S.fileno(), 0)'
+      - pattern: 'subprocess.call(["/bin/sh", "-i"])'
+      - pattern: 'subprocess.call(["/bin/bash", "-i"])'
+    message: Reverse shell or interactive shell spawning pattern detected. High probability of malicious backdoor code.
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: CWE-78
+      impact: CRITICAL
+
+  # --- Real-World Data Breach & PII Leaks ---
+  - id: python-data-breach-sensitive-logging
+    pattern-regex: '(?i)(?:logger|logging)\.(?:info|debug|warning|error|exception)\([^)]*\b(?:password|token|secret|api_key|credential|private_key)\b'
+    message: "Sensitive credential, password, or token interpolated directly into application logs, leading to potential data breach exposure."
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: CWE-532
+      impact: HIGH
+
+  # --- Real-World Cloud SSRF & Metadata Exploits ---
+  - id: python-ssrf-cloud-metadata
+    pattern-either:
+      - pattern: 'requests.$M("http://169.254.169.254" + $REST, ...)'
+      - pattern: 'requests.$M("http://metadata.google.internal" + $REST, ...)'
+      - pattern: 'httpx.$M("http://169.254.169.254" + $REST, ...)'
+      - pattern: 'httpx.$M("http://metadata.google.internal" + $REST, ...)'
+    message: Direct HTTP request targeting Cloud Instance Metadata (AWS/GCP IMDS). Highly vulnerable to SSRF credential theft.
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: CWE-918
+      impact: CRITICAL
+
+  # --- Server-Side Template Injection (SSTI) ---
+  - id: python-ssti-template-injection
+    pattern-either:
+      - pattern: 'jinja2.Template($USER_INPUT).render(...)'
+      - pattern: 'Template($USER_INPUT).render(...)'
+      - pattern: 'render_template_string($USER_INPUT, ...)'
+    message: Dynamic string passed into template engine render() function. This allows Server-Side Template Injection (SSTI) leading to remote code execution.
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: CWE-1336
+      impact: HIGH
+
+  # --- Zip Slip / Path Traversal in Extraction ---
+  - id: python-zip-slip-archive-extraction
+    pattern-either:
+      - pattern: '$ZIP.extractall(...)'
+      - pattern: '$TAR.extractall(...)'
+    message: Direct call to extractall() without validating member paths. Archives containing '../' can overwrite arbitrary system files (Zip Slip).
+    languages: [python]
+    severity: WARNING
+    metadata:
+      cwe: CWE-22
+      impact: HIGH
+
+  # --- JWT & Authentication Flaws ---
+  - id: python-jwt-weak-secret-or-none
+    pattern-either:
+      - pattern: 'jwt.decode(..., algorithms=["none"], ...)'
+      - pattern: 'jwt.decode(..., algorithms=["none"])'
+      - pattern: 'jwt.encode(..., "secret", ...)'
+      - pattern: 'jwt.encode(..., "password", ...)'
+    message: "Insecure JWT configuration: none algorithm allowed or weak default signing secret used."
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: CWE-347
+      impact: CRITICAL
+
+  # --- JavaScript / TypeScript Real-World Issues ---
+  - id: js-ts-obfuscated-eval
+    pattern-either:
+      - pattern: 'eval(atob(...))'
+      - pattern: 'eval(Buffer.from(..., "base64").toString())'
+    message: Obfuscated base64 decoded string passed directly into eval(). High risk of backdoor code execution.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      cwe: CWE-95
+      impact: CRITICAL
+
+  - id: js-ts-child-process-command-injection
+    pattern-either:
+      - pattern: 'child_process.exec(`...${$VAR}...`, ...)'
+      - pattern: 'exec(`...${$VAR}...`, ...)'
+      - pattern: 'child_process.exec("..." + $VAR, ...)'
+      - pattern: 'exec("..." + $VAR, ...)'
+    message: Untrusted variable interpolated into child_process.exec(). Pass arguments safely via execFile() or spawn().
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      cwe: CWE-78
+      impact: HIGH
+
+  - id: js-ts-sensitive-logging
+    pattern-either:
+      - pattern: 'console.log(..., $USER.password, ...)'
+      - pattern: 'console.log(..., $USER.token, ...)'
+      - pattern: 'console.info(..., $USER.password, ...)'
+      - pattern: 'console.error(..., $USER.token, ...)'
+    message: Sensitive user password or token logged directly to console output.
+    languages: [javascript, typescript]
+    severity: WARNING
+    metadata:
+      cwe: CWE-532
+      impact: HIGH

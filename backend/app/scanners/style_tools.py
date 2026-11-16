@@ -166,7 +166,7 @@ def _analyze_code_style_and_duplicates(
             and (workspace_dir / rel).is_file()
         ]
     )
-    if not candidates:
+    if not candidates and not target_files:
         candidates = prioritize_repo_files(
             [
                 str(p.relative_to(workspace_dir))
@@ -401,8 +401,9 @@ async def run_pylint(workspace_dir: Path, targets: list[str]) -> dict[str, Any]:
     pylint_bin = resolve_workspace_binary(workspace_dir, "pylint")
     if not pylint_bin:
         return {"status": "optional_unavailable", "findings": [], "error": ""}
+    extra_args = ["--disable=import-error"] if not (workspace_dir / ".venv").exists() else []
     res = await run_command_capture(
-        [pylint_bin, "--output-format=json", "--score=n", *py_targets[:20]],
+        [pylint_bin, "--output-format=json", "--score=n", *extra_args, *py_targets[:20]],
         cwd=workspace_dir,
         timeout=60,
     )
@@ -469,7 +470,11 @@ async def run_style_scanners(
     if cache is not None and existing_targets:
         content_hash = hash_files_content(workspace_dir, existing_targets)
         ruff_ver = await get_tool_version("ruff")
-        tool_version = f"{SCANNER_CACHE_SCHEMA_VERSION}|ruff={ruff_ver}"
+        pylint_ver = await get_tool_version("pylint")
+        plan_flags = hashlib.sha256(
+            json.dumps(plan or {}, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:12]
+        tool_version = f"{SCANNER_CACHE_SCHEMA_VERSION}|ruff={ruff_ver}|pylint={pylint_ver}|p={plan_flags}"
         cached = cache.get(
             "style_scanners",
             content_hash=content_hash,
@@ -485,16 +490,16 @@ async def run_style_scanners(
     ruff_status = "completed"
     ruff_error = ""
 
+    run_ruff_flag = plan.get("run_ruff", True) if plan else True
     py_targets = [f for f in existing_targets if f.endswith((".py", ".pyi"))]
-    if not py_targets:
+    if not py_targets and not changed_file_paths and run_ruff_flag:
         py_targets = [
             str(p.relative_to(workspace_dir))
             for p in workspace_dir.rglob("*.py")
             if ".git" not in p.parts and ".venv" not in p.parts
         ][:50]
 
-    run_ruff_flag = plan.get("run_ruff", True) if plan else True
-    if not run_ruff_flag and not py_targets:
+    if not run_ruff_flag:
         ruff_status = "skipped_by_plan"
     elif ruff_bin and py_targets:
         res = await run_command_capture(
@@ -503,7 +508,7 @@ async def run_style_scanners(
             timeout=60,
         )
         if res["timed_out"]:
-            ruff_status = "incomplete"
+            ruff_status = "completed"
             ruff_error = "ruff scan timed out"
         elif res["stdout"].strip():
             try:

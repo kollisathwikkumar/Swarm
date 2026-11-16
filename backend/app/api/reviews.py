@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, resolve_github_token
 from app.api.repositories import _extract_local_git_diff
+from app.config import AGENT_METADATA
 from app.database.session import get_db
 from app.integrations.github_client import GitHubAPIError, GitHubClient
 from app.models.tables import (
@@ -52,7 +53,7 @@ def _build_full_repo_payload(
     for fp in populated:
         content = snapshots[fp]
         lines = content.splitlines()
-        capped = min(len(lines), 600)
+        capped = min(len(lines), 3000)
         body = "\n".join(f"+{ln}" for ln in lines[:capped])
         patch = (
             f"diff --git a/{fp} b/{fp}\n"
@@ -69,7 +70,7 @@ def _build_full_repo_payload(
                 "status": "added",
                 "additions": len(lines),
                 "deletions": 0,
-                "changed_lines": list(range(1, min(len(lines), 200) + 1)),
+                "changed_lines": list(range(1, capped + 1)),
                 "patch": patch,
             }
         )
@@ -148,10 +149,10 @@ async def _create_and_start_review(
                     if item.get("type") == "blob"
                     and item.get("path", "").endswith(CODE_EXTENSIONS)
                     and not is_excluded_path(item.get("path", ""))
-                    and (item.get("size") or 0) < 120_000
+                    and (item.get("size") or 0) < 250_000
                 ]
-                blob_paths = prioritize_repo_files(raw_paths)[:50]
-                sem = asyncio.Semaphore(8)
+                blob_paths = prioritize_repo_files(raw_paths)[:180]
+                sem = asyncio.Semaphore(12)
 
                 async def _fetch_blob(fp: str) -> None:
                     async with sem:
@@ -183,10 +184,10 @@ async def _create_and_start_review(
                     for p in raw_tree.splitlines()
                     if p.endswith(CODE_EXTENSIONS) and not is_excluded_path(p)
                 ]
-                blob_paths = prioritize_repo_files(raw_paths)[:50]
+                blob_paths = prioritize_repo_files(raw_paths)[:180]
                 for fp in blob_paths:
                     fp_full = resolve_within_dir(mirror_dir, fp)
-                    if fp_full is not None and fp_full.exists() and fp_full.stat().st_size < 120_000:
+                    if fp_full is not None and fp_full.exists() and fp_full.stat().st_size < 250_000:
                         snapshots[fp] = fp_full.read_text(encoding="utf-8", errors="replace")
 
             diff_text, changed_files = _build_full_repo_payload(
@@ -439,9 +440,13 @@ async def get_review_detail(
         raise HTTPException(status_code=404, detail="Review not found")
 
     rev, repo, cc = row
-    agent_runs = (
-        await db.execute(select(AgentRun).where(AgentRun.review_id == rev.id))
-    ).scalars().all()
+    agent_order = {k: idx for idx, k in enumerate(AGENT_METADATA)}
+    agent_runs = sorted(
+        (
+            await db.execute(select(AgentRun).where(AgentRun.review_id == rev.id))
+        ).scalars().all(),
+        key=lambda a: agent_order.get(a.agent_name, 999),
+    )
     findings = (
         await db.execute(
             select(Finding).where(Finding.review_id == rev.id).order_by(Finding.priority_rank)
@@ -514,6 +519,11 @@ async def get_review_detail(
             {
                 "id": p.id,
                 "finding_id": p.finding_id,
+                "finding_severity": next((f.severity for f in findings if f.id == p.finding_id), "High"),
+                "finding_title": next((f.title for f in findings if f.id == p.finding_id), p.title),
+                "finding_rule_id": next((f.rule_id for f in findings if f.id == p.finding_id), None),
+                "finding_tool_name": next((f.tool_name for f in findings if f.id == p.finding_id), None),
+                "finding_evidence": next((f.evidence for f in findings if f.id == p.finding_id), None),
                 "file_path": p.file_path,
                 "title": p.title,
                 "original_code": p.original_code,

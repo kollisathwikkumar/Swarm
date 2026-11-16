@@ -91,7 +91,10 @@ function AgentOrbNode({
         {run.status === "completed" ? (
           <span className="inline-flex items-center gap-1 font-medium text-emerald-600 dark:text-emerald-400">
             <CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />
-            Completed{run.duration_ms > 0 ? ` · ${(run.duration_ms / 1000).toFixed(1)}s` : ""}
+            Completed
+            {run.duration_ms > 0
+              ? ` · ${run.duration_ms < 1000 ? `${run.duration_ms}ms` : `${(run.duration_ms / 1000).toFixed(1)}s`}`
+              : ""}
           </span>
         ) : run.status === "running" ? (
           <span className="inline-flex items-center gap-1 font-medium text-sky-600 dark:text-sky-400">
@@ -114,6 +117,12 @@ function AgentOrbNode({
           <span className="text-muted-foreground">Queued</span>
         )}
       </div>
+
+      {Boolean((run.tool_results as Record<string, unknown> | undefined)?.llm_skipped_token_saver) && (
+        <span className="mt-1 inline-flex items-center rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 font-mono text-[10px] font-medium text-emerald-700 dark:text-emerald-300">
+          Token Saver
+        </span>
+      )}
 
       {run.error_message && (
         <p

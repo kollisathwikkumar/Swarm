@@ -130,6 +130,7 @@ def retrieve_relevant_context(
     evidence_items: list[dict[str, Any]] | None = None,
     findings: list[dict[str, Any]] | None = None,
     target_files: list[str] | None = None,
+    exclude_span: tuple[str, int, int] | None = None,
     max_slices: int = 18,
 ) -> dict[str, Any]:
     """
@@ -226,6 +227,11 @@ def retrieve_relevant_context(
                 s_score += 100
                 reasons.append("diff_hunk_symbol")
                 seed_symbols.append(sid)
+            elif rel in changed_file_set and not chg_lines and not hit_lines:
+                s_score += 30
+                reasons.append("changed_module_symbol")
+                if len(seed_symbols) < 12:
+                    seed_symbols.append(sid)
             if _overlap_score(s_start, s_end, hit_lines, margin=3):
                 s_score += 110
                 reasons.append("finding_or_scanner_symbol")
@@ -293,6 +299,8 @@ def retrieve_relevant_context(
         fp = str(sym["file_path"])
         s_ln = int(sym["start_line"])
         e_ln = int(sym["end_line"])
+        if exclude_span and fp == exclude_span[0] and s_ln >= exclude_span[1] and e_ln <= exclude_span[2]:
+            continue
         span_key = (fp, s_ln, e_ln)
         if span_key in seen_spans:
             continue

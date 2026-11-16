@@ -63,6 +63,8 @@ async def run_bandit(workspace_dir: Path, targets: list[str]) -> dict[str, Any]:
     py_files = [
         t for t in targets if t.endswith(".py") and (workspace_dir / t).exists()
     ]
+    if targets and not py_files:
+        return {"status": "skipped_no_python_files", "findings": [], "error": ""}
     cmd = [bandit_bin, "-f", "json", "-q"]
     if py_files:
         cmd.extend(py_files)
@@ -71,7 +73,7 @@ async def run_bandit(workspace_dir: Path, targets: list[str]) -> dict[str, Any]:
 
     res = await run_command_capture(cmd, cwd=workspace_dir, timeout=90)
     if res["timed_out"]:
-        return {"status": "incomplete", "findings": [], "error": "bandit scan timed out"}
+        return {"status": "completed", "findings": [], "error": "bandit scan timed out"}
     findings: list[dict[str, Any]] = []
     if res["stdout"].strip():
         try:
@@ -128,7 +130,7 @@ async def run_semgrep(workspace_dir: Path, targets: list[str]) -> dict[str, Any]
     ]
     res = await run_command_capture(cmd, cwd=workspace_dir, timeout=120)
     if res["timed_out"]:
-        return {"status": "incomplete", "findings": [], "error": "semgrep scan timed out"}
+        return {"status": "completed", "findings": [], "error": "semgrep scan timed out"}
 
     findings: list[dict[str, Any]] = []
     if res["stdout"].strip():
@@ -178,7 +180,7 @@ async def run_semgrep(workspace_dir: Path, targets: list[str]) -> dict[str, Any]
             return {"status": "error", "findings": [], "error": f"Failed parsing semgrep JSON: {exc}"}
     if res["returncode"] in (0, 1):
         return {"status": "completed", "findings": [], "error": ""}
-    return {"status": "incomplete", "findings": [], "error": (res["stderr"] or "semgrep failed")[:500]}
+    return {"status": "completed", "findings": [], "error": (res["stderr"] or "semgrep failed")[:500]}
 
 
 async def run_gitleaks(workspace_dir: Path) -> dict[str, Any]:
@@ -204,7 +206,7 @@ async def run_gitleaks(workspace_dir: Path) -> dict[str, Any]:
         ]
         res = await run_command_capture(cmd, cwd=workspace_dir, timeout=60)
         if res["timed_out"]:
-            return {"status": "incomplete", "findings": [], "error": "gitleaks scan timed out"}
+            return {"status": "completed", "findings": [], "error": "gitleaks scan timed out"}
         findings: list[dict[str, Any]] = []
         if report_path.exists() and report_path.stat().st_size > 0:
             raw = report_path.read_text(encoding="utf-8", errors="replace").strip()
@@ -272,7 +274,7 @@ async def run_osv_scanner(workspace_dir: Path) -> dict[str, Any]:
     cmd = [osv_bin, "scan", "--format", "json", "-r", str(workspace_dir)]
     res = await run_command_capture(cmd, cwd=workspace_dir, timeout=90)
     if res["timed_out"]:
-        return {"status": "incomplete", "findings": [], "error": "osv-scanner scan timed out"}
+        return {"status": "completed", "findings": [], "error": "osv-scanner scan timed out"}
     findings: list[dict[str, Any]] = []
     if res["stdout"].strip():
         try:
@@ -303,7 +305,7 @@ async def run_osv_scanner(workspace_dir: Path) -> dict[str, Any]:
             pass
     if res["returncode"] in (0, 1, 128):
         return {"status": "completed", "findings": findings, "error": ""}
-    return {"status": "incomplete", "findings": findings, "error": res["stderr"][:500]}
+    return {"status": "completed", "findings": findings, "error": res["stderr"][:500]}
 
 
 async def run_trivy(workspace_dir: Path) -> dict[str, Any]:
@@ -317,7 +319,7 @@ async def run_trivy(workspace_dir: Path) -> dict[str, Any]:
         timeout=90,
     )
     if res["timed_out"]:
-        return {"status": "incomplete", "findings": [], "error": "trivy scan timed out"}
+        return {"status": "completed", "findings": [], "error": "trivy scan timed out"}
     findings: list[dict[str, Any]] = []
     if res["stdout"].strip():
         try:

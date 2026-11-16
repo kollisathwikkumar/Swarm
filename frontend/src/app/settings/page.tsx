@@ -2,7 +2,7 @@
 
 import React, { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
-import { CheckCircle2, KeyRound, Play, Save, Shield, Wrench } from "lucide-react";
+import { CheckCircle2, Info, KeyRound, Play, Save, Shield, Wrench, XCircle } from "lucide-react";
 import { apiFetch, getApiBase } from "@/lib/api";
 import { useResolvedTheme, type ColorSchemePref } from "@/lib/theme";
 import type { AgentLLMConfigItem, ReviewPolicyData } from "@/lib/types";
@@ -10,6 +10,9 @@ import type { AgentLLMConfigItem, ReviewPolicyData } from "@/lib/types";
 interface ScannerStatusItem {
   available: boolean;
   path: string;
+  optional?: boolean;
+  category?: "core" | "optional";
+  install_hint?: string;
 }
 
 function SettingsContent() {
@@ -492,26 +495,70 @@ function SettingsContent() {
             Scanners &amp; Webhook
           </h2>
 
-            <ul className="grid gap-2 sm:grid-cols-2">
-              {Object.entries(scanners).map(([name, info]) => (
-                <li
-                  key={name}
-                  className="flex items-center justify-between rounded-lg border border-border bg-muted/60 px-3 py-2 text-xs"
-                >
-                  <span className="font-mono font-semibold">{name}</span>
-                  <span
-                    className={
-                      info.available
-                        ? "flex items-center gap-1 font-mono text-emerald-700 dark:text-emerald-300"
-                        : "font-mono text-rose-700 dark:text-rose-300"
-                    }
-                  >
-                    <CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />
-                    {info.available ? "Ready" : "Missing"}
-                  </span>
-                </li>
-              ))}
-            </ul>
+            <div>
+              <p className="mb-2 text-xs font-semibold text-muted-foreground">Core Scanners</p>
+              <ul className="grid gap-2 sm:grid-cols-2">
+                {Object.entries(scanners)
+                  .filter(([, info]) => !info.optional)
+                  .map(([name, info]) => (
+                    <li
+                      key={name}
+                      title={info.path || undefined}
+                      className="flex items-center justify-between rounded-lg border border-border bg-muted/60 px-3 py-2 text-xs"
+                    >
+                      <span className="font-mono font-semibold">{name}</span>
+                      {info.available ? (
+                        <span className="flex items-center gap-1 font-mono text-emerald-700 dark:text-emerald-300">
+                          <CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />
+                          Ready
+                        </span>
+                      ) : (
+                        <span className="flex items-center gap-1 font-mono text-rose-700 dark:text-rose-300">
+                          <XCircle className="h-3.5 w-3.5" aria-hidden="true" />
+                          Missing
+                        </span>
+                      )}
+                    </li>
+                  ))}
+              </ul>
+            </div>
+
+            {Object.entries(scanners).some(([, info]) => Boolean(info.optional)) && (
+              <div>
+                <p className="mb-2 text-xs font-semibold text-muted-foreground">
+                  Optional Scanners (Auto-enabled when installed or present in target repo)
+                </p>
+                <ul className="grid gap-2 sm:grid-cols-2">
+                  {Object.entries(scanners)
+                    .filter(([, info]) => Boolean(info.optional))
+                    .map(([name, info]) => (
+                      <li
+                        key={name}
+                        title={info.path || info.install_hint || undefined}
+                        className="flex items-center justify-between gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs"
+                      >
+                        <div className="min-w-0">
+                          <span className="font-mono font-semibold">{name}</span>
+                          {!info.available && info.install_hint && (
+                            <p className="truncate text-[10px] text-muted-foreground">{info.install_hint}</p>
+                          )}
+                        </div>
+                        {info.available ? (
+                          <span className="flex shrink-0 items-center gap-1 font-mono text-emerald-700 dark:text-emerald-300">
+                            <CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />
+                            Ready
+                          </span>
+                        ) : (
+                          <span className="flex shrink-0 items-center gap-1 font-mono text-muted-foreground">
+                            <Info className="h-3.5 w-3.5" aria-hidden="true" />
+                            Optional
+                          </span>
+                        )}
+                      </li>
+                    ))}
+                </ul>
+              </div>
+            )}
 
             <div className="rounded-lg border border-border bg-muted/60 p-3 text-xs">
               <p className="font-semibold">GitHub Seamless Sync &amp; Webhook Tunnel</p>

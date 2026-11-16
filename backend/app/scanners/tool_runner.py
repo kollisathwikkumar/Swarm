@@ -105,14 +105,38 @@ def resolve_workspace_binary(workspace_dir: Path, name: str) -> str | None:
     return resolve_binary(name)
 
 
+_OPTIONAL_INSTALL_HINTS: dict[str, str] = {
+    "eslint": "npm install --save-dev eslint (in target repo)",
+    "pylint": "pip install pylint (optional Python linter; Ruff is active)",
+    "codeql": "Install GitHub CodeQL CLI bundle on host",
+    "trivy": "brew install trivy",
+    "mypy": "pip install mypy (optional Python type-checker)",
+    "tsc": "npm install --save-dev typescript (in target repo)",
+    "hypothesis": "pip install hypothesis (optional property testing)",
+    "mutmut": "pip install mutmut (optional mutation testing)",
+}
+
+
 async def check_installed_scanners() -> dict[str, dict[str, Any]]:
     core_tools = ["git", "semgrep", "gitleaks", "bandit", "osv-scanner", "ruff", "pytest", "coverage", "node"]
     optional_tools = ["eslint", "pylint", "codeql", "trivy", "mypy", "tsc", "hypothesis", "mutmut"]
     status: dict[str, dict[str, Any]] = {}
     for tool in core_tools:
         path = resolve_binary(tool)
-        status[tool] = {"available": path is not None, "path": path or "", "optional": False}
+        status[tool] = {
+            "available": path is not None,
+            "path": path or "",
+            "optional": False,
+            "category": "core",
+            "install_hint": "",
+        }
     for tool in optional_tools:
         path = resolve_binary(tool)
-        status[tool] = {"available": path is not None, "path": path or "", "optional": True}
+        status[tool] = {
+            "available": path is not None,
+            "path": path or "",
+            "optional": True,
+            "category": "optional",
+            "install_hint": _OPTIONAL_INSTALL_HINTS.get(tool, ""),
+        }
     return status

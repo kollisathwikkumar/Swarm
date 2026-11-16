@@ -316,23 +316,27 @@ def _parse_ts_js_module(rel_path: str, src: str, lines: list[str]) -> tuple[list
 def _parse_markdown_or_config(rel_path: str, lines: list[str], lang: str) -> tuple[list[dict[str, Any]], list[str]]:
     symbols: list[dict[str, Any]] = []
     if lang == "markdown":
+        heading_indices: list[tuple[int, str]] = []
         for idx, ln in enumerate(lines, start=1):
             if ln.startswith(("# ", "## ", "### ")):
-                heading = ln.lstrip("#").strip()[:100]
-                symbols.append(
-                    {
-                        "symbol_id": f"{rel_path}::{heading}",
-                        "name": heading,
-                        "kind": "heading",
-                        "file_path": rel_path,
-                        "start_line": idx,
-                        "end_line": min(len(lines), idx + 20),
-                        "signature": ln.strip()[:120],
-                        "calls": [],
-                    }
-                )
-            if len(symbols) >= 25:
+                heading_indices.append((idx, ln))
+            if len(heading_indices) >= 40:
                 break
+        for i, (idx, ln) in enumerate(heading_indices):
+            next_idx = heading_indices[i + 1][0] - 1 if i + 1 < len(heading_indices) else len(lines)
+            heading = ln.lstrip("#").strip()[:100]
+            symbols.append(
+                {
+                    "symbol_id": f"{rel_path}::{heading}",
+                    "name": heading,
+                    "kind": "heading",
+                    "file_path": rel_path,
+                    "start_line": idx,
+                    "end_line": min(len(lines), max(idx, min(next_idx, idx + 60))),
+                    "signature": ln.strip()[:120],
+                    "calls": [],
+                }
+            )
     elif lines:
         symbols.append(
             {
@@ -341,7 +345,7 @@ def _parse_markdown_or_config(rel_path: str, lines: list[str], lang: str) -> tup
                 "kind": lang,
                 "file_path": rel_path,
                 "start_line": 1,
-                "end_line": min(len(lines), 80),
+                "end_line": min(len(lines), 120),
                 "signature": Path(rel_path).name,
                 "calls": [],
             }
@@ -469,7 +473,7 @@ def _index_single_file(
                 "kind": "module",
                 "file_path": rel_path,
                 "start_line": 1,
-                "end_line": min(len(lines), 80),
+                "end_line": min(len(lines), 120),
                 "signature": Path(rel_path).name,
                 "calls": _extract_calls_from_slice(lines, 1, min(len(lines), 120)),
             }

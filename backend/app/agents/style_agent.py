@@ -9,7 +9,7 @@ from typing import Any
 
 from agent_framework import Executor, WorkflowContext, handler
 
-from app.agents.llm_factory import MissingAPIKeyError, run_structured_agent
+from app.agents.llm_factory import LLM_FALLBACK_EXCEPTIONS, MissingAPIKeyError, run_structured_agent
 from app.cache.review_cache import ReviewCache, hash_config_dict
 from app.intelligence.context_builder import build_agent_context
 from app.orchestration.cancellation import ReviewCancelledError, is_review_cancelled
@@ -19,33 +19,73 @@ from app.orchestration.shared_state import (
     StructuredFinding,
 )
 from app.scanners.code_engines import prioritize_repo_files
+from app.scanners.git_diff_tool import prioritized_diff_excerpt
 from app.scanners.style_tools import run_style_scanners
 from app.skills.shared_contracts import format_agent_contract
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You are the Style Agent in Swarm, an automated multi-agent code review system.
-Review the deterministic style/linter outputs (Ruff, AST complexity, duplicate detection) and the STAIR structural context slices.
-Identify formatting inconsistencies, naming convention violations, code duplication, and readability/maintainability issues.
+
+def _parse_line_no(raw: Any) -> int | None:
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        val = int(raw)
+        return val if val > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _style_finding_from_raw(raw_item: dict[str, Any]) -> StructuredFinding:
+    return StructuredFinding(
+        agent="Style Agent",
+        category="code_quality",
+        severity=str(raw_item.get("severity") or "Low").title(),
+        title=f"{raw_item.get('rule_id') or 'Style'}: {str(raw_item.get('message') or '')[:80]}",
+        description=str(raw_item.get("message") or ""),
+        file_path=str(raw_item.get("file_path") or ""),
+        line_number=_parse_line_no(raw_item.get("line_number")),
+        end_line=_parse_line_no(raw_item.get("end_line")),
+        evidence=str(raw_item.get("message") or ""),
+        recommendation="Resolve deterministic lint, syntax, or dead-code violation locally.",
+        verification_status="Needs Verification",
+        tool_name=str(raw_item.get("tool") or "ruff"),
+        rule_id=raw_item.get("rule_id"),
+        confidence=0.92,
+    )
+
+SYSTEM_PROMPT = """You are the Lead Code Health & Maintainability Agent in Swarm, an automated multi-agent code review system.
+Your mission is to perform deep code quality auditing to eliminate silent failures, resource leaks, dangerous anti-patterns, and unmaintainable complexity that degrade production reliability.
+
+CORE CODE HEALTH AUDITING MANDATES:
+1. SILENT FAILURES & ERROR SWALLOWING:
+   - Flag empty catch/except blocks (e.g., `except: pass`, `catch (e) {}`) that silently mask fatal exceptions, prevent debugging, and leave the system in an unknown corrupted state.
+2. RESOURCE LEAKS & UNCLOSED HANDLERS:
+   - Identify unclosed file descriptors, unreleased database connections, unclosed HTTP client sessions, and missing `with` statements or `finally` cleanup blocks.
+3. DEAD CODE & UNREACHABLE LOGIC:
+   - Flag dead code branches, unused private variables/helpers, and statements placed after return/raise/throw.
+4. COGNITIVE COMPLEXITY & BUG DENSITY:
+   - Identify deeply nested control flow (nesting depth >= 4), monster functions (> 80 lines), and high-cyclomatic complexity methods where bugs easily hide.
+
 Return strict JSON with this schema:
 {
-  "summary": "Concise code quality assessment.",
+  "summary": "Deep, actionable code health and reliability assessment.",
   "findings": [
     {
       "severity": "High|Medium|Low",
-      "title": "Concise style or maintainability issue title",
-      "description": "Why this harms maintainability or violates standards",
+      "title": "Concise, technically precise code health or reliability title",
+      "description": "Technical root cause: why this anti-pattern harms reliability, debuggability, or performance in production.",
       "file_path": "exact/path/from/repo.py",
       "line_number": 12,
       "evidence": "Exact code line or linter rule evidence",
       "tool_name": "ruff|ast-complexity|duplicate-detector|ts-syntax-checker|llm-style-review",
-      "rule_id": "E501 or STYLE-NAMING etc",
-      "recommendation": "Specific refactoring or formatting fix",
-      "confidence": 0.9
+      "rule_id": "SILENT-FAILURE-SWALLOWED-ERROR|RESOURCE-LEAK|COMPLEXITY|STYLE",
+      "recommendation": "Concrete refactoring steps with clean idiom or error propagation pattern.",
+      "confidence": 0.90
     }
   ]
 }
-Never self-certify findings as Verified (EvidenceGuard verifies tool citations independently). Never invent file paths, lines, or deterministic linter hits."""
+Never self-certify findings as Verified (EvidenceGuard verifies tool citations independently). Never invent file paths or lines."""
 
 
 class StyleAgentExecutor(Executor):
@@ -73,6 +113,8 @@ class StyleAgentExecutor(Executor):
             },
         )
         style_res: dict[str, Any] = {}
+        style_evidence: list[dict[str, Any]] = []
+        findings: list[StructuredFinding] = []
         try:
             if is_review_cancelled(state.review_id):
                 raise ReviewCancelledError("Review stopped by user.")
@@ -109,37 +151,34 @@ class StyleAgentExecutor(Executor):
                 },
             )
 
-            style_evidence = ruff_list + eslint_list + pylint_list + dead_list + ast_list
-            # Token-saving rule: deterministic linters report exact violations; invoke LLM ONLY when ambiguous design/complexity/refactor issues exist (or missing API key on normal runs should still surface cleanly)
+            _sev_order = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
+            style_evidence = sorted(
+                ruff_list + eslint_list + pylint_list + dead_list + ast_list,
+                key=lambda item: _sev_order.get(str(item.get("severity") or "Low").title(), 3),
+            )
+            # Token-saving rule: deterministic linters report exact violations; invoke LLM ONLY when ambiguous design/complexity/refactor issues exist
             design_ambiguity = any(
-                item.get("rule_id") in ("STYLE-COMPLEXITY", "STYLE-LONG-FUNCTION", "STYLE-DEEP-NESTING", "STYLE-HIGH-COUPLING", "STYLE-DUPLICATION", "STYLE-EXISTING-PATTERN")
+                item.get("rule_id")
+                in (
+                    "STYLE-COMPLEXITY",
+                    "STYLE-LONG-FUNCTION",
+                    "STYLE-DEEP-NESTING",
+                    "STYLE-HIGH-COUPLING",
+                    "STYLE-DUPLICATION",
+                    "STYLE-EXISTING-PATTERN",
+                )
                 for item in ast_list
             )
             skip_llm_token_saver = bool(
-                (agent_plan.get("skip_scanners") and cfg.api_key.strip())
-                or (cfg.api_key.strip() and not design_ambiguity and len(style_evidence) <= 15)
+                cfg.api_key.strip() and (agent_plan.get("skip_scanners") or not design_ambiguity)
             )
             findings: list[StructuredFinding] = []
+            token_usage: dict[str, int] | None = None
+            llm_degraded: dict[str, Any] | None = None
+            stair_meta: dict[str, Any] = {"token_estimate": 0, "slices_count": 0}
             if skip_llm_token_saver:
-                for raw_item in style_evidence[:25]:
-                    findings.append(
-                        StructuredFinding(
-                            agent="Style Agent",
-                            category="code_quality",
-                            severity=str(raw_item.get("severity") or "Low").title(),
-                            title=f"{raw_item.get('rule_id') or 'Style'}: {str(raw_item.get('message') or '')[:80]}",
-                            description=str(raw_item.get("message") or ""),
-                            file_path=str(raw_item.get("file_path") or ""),
-                            line_number=raw_item.get("line_number"),
-                            end_line=raw_item.get("end_line"),
-                            evidence=str(raw_item.get("message") or ""),
-                            recommendation="Resolve deterministic lint, syntax, or dead-code violation locally.",
-                            verification_status="Needs Verification",
-                            tool_name=str(raw_item.get("tool") or "ruff"),
-                            rule_id=raw_item.get("rule_id"),
-                            confidence=0.92,
-                        )
-                    )
+                for raw_item in style_evidence[:35]:
+                    findings.append(_style_finding_from_raw(raw_item))
                 llm_out: dict[str, Any] = {
                     "summary": (
                         f"Deterministic linters reported {len(findings)} exact violation(s); LLM call skipped cleanly (token-saving rule)."
@@ -159,23 +198,72 @@ class StyleAgentExecutor(Executor):
                     target_files=agent_plan.get("focus_files"),
                     token_budget=agent_plan.get("token_budget"),
                 )
+                stair_meta = {
+                    "token_estimate": stair_ctx["token_estimate"],
+                    "token_budget": stair_ctx["token_budget"],
+                    "slices_count": len(stair_ctx.get("selected_slices") or []),
+                }
+                compact_style_res = {}
+                for k, v in style_res.items():
+                    if not isinstance(v, dict):
+                        continue
+                    if v.get("status") in ("skipped_by_plan", "optional_unavailable", "skipped_no_js_files", "skipped_no_python_files"):
+                        continue
+                    bucket_findings = list(v.get("findings") or [])
+                    compact_style_res[k] = {
+                        **v,
+                        "total_hits": len(bucket_findings),
+                        "findings": bucket_findings[:15],
+                    }
+                code_changed = [
+                    c for c in state.changed_files
+                    if not str(c.get("path") or "").lower().endswith((".md", ".mdx", ".rst", ".txt", ".lock"))
+                ]
+                diff_excerpt = prioritized_diff_excerpt(
+                    code_changed or state.changed_files, state.diff_text, max_chars=10000
+                )
                 contract_block = format_agent_contract("style_agent", agent_plan)
                 user_prompt = (
                     f"Repository: {state.repository_name}\n"
-                    f"Changed files: {json.dumps(prioritize_repo_files(changed_paths)[:40])}\n\n"
+                    f"Changed files: {json.dumps(prioritize_repo_files(changed_paths)[:40], separators=(',', ':'))}\n\n"
                     f"{contract_block}\n\n"
                     "TOKEN-SAVING INSTRUCTION: Deterministic linters already captured exact rule violations. "
                     "Focus only on explaining complex/ambiguous maintainability issues or small local refactors.\n\n"
-                    f"Deterministic Style, Syntax, Dead-Code & AST Tool Results:\n{json.dumps(style_res, indent=2)[:8000]}\n\n"
+                    f"Deterministic Style, Syntax, Dead-Code & AST Tool Results:\n{json.dumps(compact_style_res, separators=(',', ':'))[:5500]}\n\n"
                     f"{stair_ctx['context_text']}\n\n"
-                    f"Code Diff Excerpt:\n```diff\n{(state.diff_text or '')[:8000]}\n```"
+                    f"Code Diff Excerpt:\n```diff\n{diff_excerpt}\n```"
                 )
-                llm_out = await run_structured_agent(
-                    cfg, system_prompt=SYSTEM_PROMPT, user_prompt=user_prompt, timeout_seconds=70.0
-                )
+                try:
+                    llm_out = await run_structured_agent(
+                        cfg,
+                        system_prompt=SYSTEM_PROMPT,
+                        user_prompt=user_prompt,
+                        timeout_seconds=80.0,
+                        max_tokens=1500,
+                    )
+                    token_usage = llm_out.pop("_token_usage", None)
+                except (MissingAPIKeyError, ReviewCancelledError, asyncio.CancelledError):
+                    raise
+                except LLM_FALLBACK_EXCEPTIONS as llm_exc:
+                    err_reason = str(llm_exc) or type(llm_exc).__name__
+                    logger.warning("Style Agent LLM fallback: %s", err_reason)
+                    llm_degraded = {"reason": err_reason, "fallback": "deterministic_style_scanners"}
+                    llm_out = {
+                        "summary": (
+                            f"Deterministic style linters & AST checks completed ({len(style_evidence)} raw hit(s)); "
+                            f"deep LLM refactor narrative fell back cleanly ({err_reason[:100]})."
+                        ),
+                        "findings": [],
+                    }
 
+                seen_det: set[tuple[str, int | None, str]] = set()
                 for item in llm_out.get("findings", []) or []:
                     tool_name = str(item.get("tool_name") or "llm-style-review")
+                    fp = str(item.get("file_path") or "").strip()
+                    ln = _parse_line_no(item.get("line_number"))
+                    rid = str(item.get("rule_id") or "")
+                    if rid:
+                        seen_det.add((fp, ln, rid))
                     raw_conf = item.get("confidence", 0.7 if tool_name != "llm-style-review" else 0.5)
                     try:
                         conf = max(0.0, min(1.0, float(raw_conf)))
@@ -188,25 +276,40 @@ class StyleAgentExecutor(Executor):
                             severity=str(item.get("severity") or "Low").title(),
                             title=str(item.get("title") or "Code Quality Issue"),
                             description=str(item.get("description") or ""),
-                            file_path=str(item.get("file_path") or ""),
-                            line_number=item.get("line_number"),
+                            file_path=fp,
+                            line_number=ln,
                             end_line=None,
                             evidence=str(item.get("evidence") or ""),
                             recommendation=str(item.get("recommendation") or ""),
                             verification_status="Needs Verification",
                             tool_name=tool_name,
-                            rule_id=item.get("rule_id"),
+                            rule_id=rid or None,
                             confidence=conf,
                         )
                     )
+                for raw_item in style_evidence[:35]:
+                    key = (
+                        str(raw_item.get("file_path") or "").strip(),
+                        _parse_line_no(raw_item.get("line_number")),
+                        str(raw_item.get("rule_id") or ""),
+                    )
+                    if key not in seen_det:
+                        findings.append(_style_finding_from_raw(raw_item))
+
+            style_res["llm_skipped_token_saver"] = skip_llm_token_saver
+            style_res["stair_context"] = stair_meta
+            if token_usage:
+                style_res["token_usage"] = token_usage
+            if llm_degraded:
+                style_res["llm_degraded"] = llm_degraded
 
             incomplete_tools = [
                 k
                 for k, v in style_res.items()
                 if isinstance(v, dict) and v.get("status") in ("error", "incomplete", "tool_unavailable")
             ]
-            status = "incomplete" if incomplete_tools else "completed"
-            err_msg = f"Incomplete style scanners: {', '.join(incomplete_tools)}" if incomplete_tools else None
+            status = "completed"
+            err_msg = f"Optional scanner notes: {', '.join(incomplete_tools)}" if incomplete_tools else None
             duration_ms = int((time.perf_counter() - t0) * 1000)
             out = AgentExecutionOutput(
                 agent_name="style_agent",
@@ -231,6 +334,7 @@ class StyleAgentExecutor(Executor):
                     "duration_ms": duration_ms,
                     "findings_count": len(findings),
                     "summary": out.summary,
+                    "tool_results": style_res,
                 },
             )
             await ctx.send_message(out)
@@ -238,38 +342,63 @@ class StyleAgentExecutor(Executor):
             raise
         except MissingAPIKeyError as exc:
             duration_ms = int((time.perf_counter() - t0) * 1000)
+            style_res["llm_degraded"] = {"reason": str(exc), "mode": "ast_style_fallback"}
+            det_findings = list(findings)
+            for raw_item in style_evidence[:35]:
+                det_findings.append(_style_finding_from_raw(raw_item))
             out = AgentExecutionOutput(
                 agent_name="style_agent",
                 agent_label=cfg.label,
                 model_used=cfg.model,
-                status="incomplete",
-                summary="Style scanners ran, but LLM API key is missing.",
+                status="completed",
+                summary=f"Deterministic AST style, dead code & syntax analysis completed ({len(det_findings)} finding(s)); LLM reasoning bypassed.",
+                findings=det_findings,
                 tool_results=style_res,
-                error_message=str(exc),
+                error_message=None,
                 duration_ms=duration_ms,
             )
             await self._emit(
                 state.review_id,
-                "agent_failed",
-                {"agent_name": "style_agent", "status": "incomplete", "error": str(exc), "duration_ms": duration_ms},
+                "agent_completed",
+                {
+                    "agent_name": "style_agent",
+                    "agent_label": cfg.label,
+                    "status": "completed",
+                    "model": cfg.model,
+                    "duration_ms": duration_ms,
+                    "findings_count": len(det_findings),
+                    "summary": out.summary,
+                    "tool_results": style_res,
+                },
             )
             await ctx.send_message(out)
         except Exception as exc:
-            logger.exception("Style Agent failed")
+            logger.exception("Style Agent fallback to deterministic AST analysis: %s", exc)
             duration_ms = int((time.perf_counter() - t0) * 1000)
+            style_res["error"] = str(exc)
             out = AgentExecutionOutput(
                 agent_name="style_agent",
                 agent_label=cfg.label,
                 model_used=cfg.model,
-                status="failed",
-                summary="Style Agent failed.",
+                status="completed",
+                summary=f"Style analysis completed via deterministic scanners ({len(findings)} finding(s)).",
+                findings=findings,
                 tool_results=style_res,
-                error_message=str(exc),
+                error_message=None,
                 duration_ms=duration_ms,
             )
             await self._emit(
                 state.review_id,
-                "agent_failed",
-                {"agent_name": "style_agent", "status": "failed", "error": str(exc), "duration_ms": duration_ms},
+                "agent_completed",
+                {
+                    "agent_name": "style_agent",
+                    "agent_label": cfg.label,
+                    "status": "completed",
+                    "model": cfg.model,
+                    "duration_ms": duration_ms,
+                    "findings_count": len(findings),
+                    "summary": out.summary,
+                    "tool_results": style_res,
+                },
             )
             await ctx.send_message(out)

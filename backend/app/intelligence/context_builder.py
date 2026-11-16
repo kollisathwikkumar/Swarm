@@ -8,12 +8,12 @@ from app.intelligence.stair_retriever import retrieve_relevant_context
 from app.scanners.code_engines import read_prioritized_workspace_files
 
 AGENT_TOKEN_BUDGETS: dict[str, int] = {
-    "diff_agent": 3000,
-    "style_agent": 2000,
-    "security_agent": 5000,
-    "test_coverage_agent": 3500,
-    "reviewer_manager": 3000,
-    "fix_suggestion_agent": 4000,
+    "diff_agent": 2400,
+    "style_agent": 1600,
+    "security_agent": 4000,
+    "test_coverage_agent": 2400,
+    "reviewer_manager": 2400,
+    "fix_suggestion_agent": 3200,
 }
 
 
@@ -21,20 +21,24 @@ def _approx_tokens(text: str) -> int:
     return max(1, (len(text) + 3) // 4)
 
 
-def _format_toc_section(toc_tree: list[dict[str, Any]]) -> str:
+def _format_toc_section(toc_tree: list[dict[str, Any]], *, max_tokens: int | None = None) -> str:
     if not toc_tree:
         return ""
-    lines = ["=== STAIR HIERARCHICAL CODE INDEX (Repository -> Package -> Module -> Symbol) ==="]
+    header = "=== STAIR HIERARCHICAL CODE INDEX (Repository -> Package -> Module -> Symbol) ==="
+    lines = [header]
     for item in toc_tree[:12]:
-        sym_list = ", ".join(item.get("symbols") or []) or "<module-level>"
+        sym_list = ", ".join((item.get("symbols") or [])[:8]) or "<module-level>"
         reasons = ", ".join(item.get("reasons") or [])
         guards = item.get("guards") or {}
-        guard_str = f" | guards={json.dumps(guards)}" if guards else ""
-        lines.append(
+        guard_str = f" | guards={json.dumps(guards, separators=(',', ':'))}" if guards else ""
+        candidate = (
             f"- [{item.get('package')}] {item.get('file_path')} "
             f"({item.get('total_lines')} lines, {item.get('language')}) "
             f"[{reasons}]: symbols=[{sym_list}]{guard_str}"
         )
+        if max_tokens is not None and len(lines) > 1 and _approx_tokens("\n".join([*lines, candidate])) > max_tokens:
+            break
+        lines.append(candidate)
     return "\n".join(lines)
 
 
@@ -48,6 +52,7 @@ def build_agent_context(
     evidence_items: list[dict[str, Any]] | None = None,
     findings: list[dict[str, Any]] | None = None,
     target_files: list[str] | None = None,
+    exclude_span: tuple[str, int, int] | None = None,
     token_budget: int | None = None,
     expand_for_high_risk: bool = False,
 ) -> dict[str, Any]:
@@ -68,6 +73,7 @@ def build_agent_context(
             evidence_items=evidence_items,
             findings=findings,
             target_files=target_files,
+            exclude_span=exclude_span,
         )
         if structure_index and structure_index.get("modules")
         else {"toc_tree": [], "slices": [], "selected_modules": []}
@@ -78,9 +84,22 @@ def build_agent_context(
 
     # Fallback to linear prioritized reader for binary/unsupported/empty-AST repos
     if not slices:
+        if exclude_span:
+            toc_only = _format_toc_section(
+                toc_tree, max_tokens=max(200, int(effective_budget * 0.35))
+            )
+            return {
+                "role": role,
+                "context_text": toc_only,
+                "toc_tree": toc_tree,
+                "selected_slices": [],
+                "token_estimate": _approx_tokens(toc_only) if toc_only else 0,
+                "token_budget": effective_budget,
+                "fallback_used": False,
+            }
         changed_paths = [str(c.get("path")) for c in changed_files if c.get("path")]
         extra_paths = [p for p in (target_files or []) if p not in changed_paths]
-        max_chars = max(2000, effective_budget * 4)
+        max_chars = max(1200, effective_budget * 4)
         fallback_files = read_prioritized_workspace_files(
             workspace_dir,
             changed_paths + extra_paths,
@@ -89,7 +108,7 @@ def build_agent_context(
         )
         fallback_text = (
             f"=== FALLBACK PRIORITIZED FILES (budget={effective_budget} tokens) ===\n"
-            f"{json.dumps(fallback_files, indent=2)[:max_chars]}"
+            f"{json.dumps(fallback_files, separators=(',', ':'))[:max_chars]}"
         )
         return {
             "role": role,
@@ -101,7 +120,8 @@ def build_agent_context(
             "fallback_used": True,
         }
 
-    toc_text = _format_toc_section(toc_tree)
+    toc_budget = max(220, int(effective_budget * 0.35))
+    toc_text = _format_toc_section(toc_tree, max_tokens=toc_budget)
     toc_tokens = _approx_tokens(toc_text)
     used_tokens = toc_tokens
 

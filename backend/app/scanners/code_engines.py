@@ -429,7 +429,7 @@ async def run_deterministic_code_guards(
         and (workspace_dir / rel).exists()
         and (workspace_dir / rel).is_file()
         and rel.endswith((".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"))
-    ][:30]
+    ][:100]
 
     for rel in candidates:
         target = workspace_dir / rel

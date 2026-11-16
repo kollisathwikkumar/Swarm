@@ -1,17 +1,15 @@
 "use client";
 
 import React, { useCallback, useEffect, useState } from "react";
-import Link from "next/link";
-import { DiffEditor } from "@monaco-editor/react";
-import { Check, Github, ShieldCheck, Wrench, X } from "lucide-react";
+import { Github, Wrench } from "lucide-react";
 import { apiFetch, commitAllPatchesToGithub } from "@/lib/api";
-import { useResolvedTheme } from "@/lib/theme";
+import { PatchCard } from "@/components/PatchCard";
 import type { PatchSuggestionItem } from "@/lib/types";
 
 export default function FixSuggestionsPage() {
-  const { resolved } = useResolvedTheme();
   const [patches, setPatches] = useState<PatchSuggestionItem[]>([]);
   const [filter, setFilter] = useState("ALL");
+  const [repoFilter, setRepoFilter] = useState("ALL");
   const [loading, setLoading] = useState(true);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
@@ -46,7 +44,7 @@ export default function FixSuggestionsPage() {
         method: "POST",
         body: JSON.stringify({ action }),
       });
-      setNotice(`Patch "${patch.title}" updated (${action}).`);
+      setNotice(`Patch "${patch.title}" updated (${action.replace(/_/g, " ")}).`);
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Action failed");
@@ -55,9 +53,17 @@ export default function FixSuggestionsPage() {
     }
   };
 
-  const committableGithubPatches = patches.filter(
+  const repoNames = Array.from(new Set(patches.map((p) => p.repository_name).filter(Boolean)));
+
+  const displayedPatches = patches.filter((p) => {
+    if (repoFilter !== "ALL" && p.repository_name !== repoFilter) return false;
+    return true;
+  });
+
+  const committableGithubPatches = displayedPatches.filter(
     (p) =>
       p.source_type === "github" &&
+      p.applicability_verified &&
       (p.approval_status === "pending_approval" || p.approval_status === "approved")
   );
 
@@ -83,7 +89,13 @@ export default function FixSuggestionsPage() {
   return (
     <div className="space-y-6">
       <header className="flex flex-wrap items-center justify-between gap-4 border-b border-border pb-4">
-        <h1 className="text-2xl font-semibold tracking-tight">Fix Suggestions</h1>
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight text-foreground">Fix Suggestions &amp; Resolution Paths</h1>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Sandbox-verified AST patches, step-by-step resolution paths for AI agents, and deterministic regression test proofs.
+          </p>
+        </div>
+
         <div className="flex flex-wrap items-center gap-2.5">
           {committableGithubPatches.length > 0 && (
             <button
@@ -96,13 +108,30 @@ export default function FixSuggestionsPage() {
               Approve &amp; Commit All to GitHub ({committableGithubPatches.length})
             </button>
           )}
+
+          {repoNames.length > 1 && (
+            <select
+              aria-label="Filter fix suggestions by repository"
+              value={repoFilter}
+              onChange={(e) => setRepoFilter(e.target.value)}
+              className="min-h-10 rounded-lg border border-border bg-card px-3 py-1.5 font-mono text-xs"
+            >
+              <option value="ALL">All Repositories ({repoNames.length})</option>
+              {repoNames.map((r) => (
+                <option key={r} value={r}>
+                  {r}
+                </option>
+              ))}
+            </select>
+          )}
+
           <select
             aria-label="Filter fix suggestions by status"
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
             className="min-h-10 rounded-lg border border-border bg-card px-3 py-1.5 font-mono text-xs"
           >
-            <option value="ALL">All Statuses</option>
+            <option value="ALL">All Statuses ({displayedPatches.length})</option>
             <option value="pending_approval">Pending Approval</option>
             <option value="approved">Approved</option>
             <option value="applied">Applied</option>
@@ -127,105 +156,25 @@ export default function FixSuggestionsPage() {
       )}
 
       {loading ? (
-        <p className="font-mono text-xs text-muted-foreground">Loading patches...</p>
-      ) : patches.length === 0 ? (
+        <p className="font-mono text-xs text-muted-foreground">Loading verified patch suggestions...</p>
+      ) : displayedPatches.length === 0 ? (
         <div className="rounded-xl border border-dashed border-border bg-card p-10 text-center">
           <Wrench className="mx-auto mb-2 h-6 w-6 text-muted-foreground" aria-hidden="true" />
-          <p className="text-sm font-medium">No fix suggestions available yet</p>
+          <p className="text-sm font-medium">No fix suggestions match your filter</p>
           <p className="mt-1 text-xs text-muted-foreground">
-            When the Fix-Suggestion Agent proposes syntax-verified patches for actionable findings, they appear here.
+            Try switching repositories or resetting the status filter.
           </p>
         </div>
       ) : (
-        <div className="space-y-5">
-          {patches.map((patch) => (
-            <article key={patch.id} className="space-y-4 rounded-xl border border-border bg-card p-5">
-              <div className="flex flex-wrap items-start justify-between gap-3">
-                <div>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <h2 className="text-base font-semibold">{patch.title}</h2>
-                    <span className="rounded border border-border bg-muted px-2 py-0.5 font-mono text-[10px] uppercase text-muted-foreground">
-                      {patch.approval_status}
-                    </span>
-                  </div>
-                    <p className="mt-1 font-mono text-xs text-muted-foreground">
-                      {patch.repository_name} · {patch.file_path}
-                    </p>
-                    <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
-                      {patch.explanation}
-                    </p>
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span
-                      className={`inline-flex items-center gap-1 rounded px-2.5 py-1 font-mono text-[11px] font-semibold ${
-                        patch.applicability_verified
-                          ? "bg-emerald-500/12 text-emerald-700 dark:text-emerald-300"
-                          : "bg-amber-500/12 text-amber-800 dark:text-amber-300"
-                      }`}
-                    >
-                      <ShieldCheck className="h-3.5 w-3.5" aria-hidden="true" />
-                      {patch.validation_output ||
-                        (patch.applicability_verified ? "Patch Validated" : "Needs Manual Check")}
-                    </span>
-                    <Link href={`/reviews/${patch.review_id}`} className="font-mono text-xs font-semibold hover:underline">
-                      View Review →
-                    </Link>
-                  </div>
-                </div>
-
-                <div className="h-72 overflow-hidden rounded-lg border border-border">
-                  <DiffEditor
-                    height="100%"
-                    theme={resolved === "dark" ? "vs-dark" : "light"}
-                    language={patch.file_path.endsWith(".py") ? "python" : "typescript"}
-                    original={patch.original_code}
-                    modified={patch.proposed_code}
-                    options={{ readOnly: true, minimap: { enabled: false }, fontSize: 12 }}
-                  />
-                </div>
-
-                <div className="flex flex-wrap justify-end gap-2">
-                  <button
-                    type="button"
-                    disabled={busy || patch.approval_status === "applied"}
-                    onClick={() => act(patch, "reject")}
-                    className="inline-flex min-h-10 items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-rose-700 hover:bg-rose-500/10 disabled:opacity-50 dark:text-rose-300"
-                  >
-                    <X className="h-3.5 w-3.5" aria-hidden="true" />
-                    Reject
-                  </button>
-                  <button
-                    type="button"
-                    disabled={busy || patch.approval_status === "approved" || patch.approval_status === "applied"}
-                    onClick={() => act(patch, "approve")}
-                    className="inline-flex min-h-10 items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-emerald-700 hover:bg-emerald-500/10 disabled:opacity-50 dark:text-emerald-300"
-                  >
-                    <Check className="h-3.5 w-3.5" aria-hidden="true" />
-                    Approve
-                  </button>
-                  {patch.source_type === "local" && (
-                    <button
-                      type="button"
-                      disabled={busy || !patch.applicability_verified || patch.approval_status === "applied"}
-                      onClick={() => act(patch, "apply_local")}
-                      className="inline-flex min-h-10 items-center gap-1.5 rounded-lg bg-primary px-3.5 py-1.5 text-xs font-semibold text-primary-foreground disabled:opacity-50"
-                    >
-                      {patch.approval_status === "applied" ? "Applied Locally" : "Approve & Apply Locally"}
-                    </button>
-                  )}
-                  {patch.source_type === "github" && (
-                    <button
-                      type="button"
-                      disabled={busy || patch.approval_status === "applied" || patch.approval_status === "rejected"}
-                      onClick={() => act(patch, "commit_to_github_branch")}
-                      className="inline-flex min-h-10 items-center gap-1.5 rounded-lg bg-primary px-3.5 py-1.5 text-xs font-semibold text-primary-foreground disabled:opacity-50"
-                    >
-                      {patch.approval_status === "applied" ? "Committed to GitHub" : "Approve & Commit to GitHub"}
-                    </button>
-                  )}
-                </div>
-            </article>
+        <div className="space-y-6">
+          {displayedPatches.map((patch) => (
+            <PatchCard
+              key={patch.id}
+              patch={patch}
+              busy={busy}
+              onDecision={act}
+              showReviewLink={true}
+            />
           ))}
         </div>
       )}

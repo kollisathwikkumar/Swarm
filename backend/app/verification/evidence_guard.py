@@ -259,6 +259,9 @@ def build_evidence_store(
             for fp in tr.get("changed_file_coverage") or {}:
                 cov_info = (tr.get("changed_file_coverage") or {}).get(fp) or {}
                 missing = cov_info.get("missing_lines") or []
+                pct = float(cov_info.get("percent_covered", 0.0) or 0.0)
+                if not missing and pct >= 100.0:
+                    continue
                 first_missing = missing[0] if missing else 1
                 _add_record(
                     tool_name="coverage.py",
@@ -266,7 +269,7 @@ def build_evidence_store(
                     file_path=fp,
                     line_number=first_missing,
                     end_line=missing[-1] if missing else None,
-                    snippet=f"Coverage: {cov_info.get('percent_covered', 0)}% (missing lines: {missing[:6]})",
+                    snippet=f"Coverage: {pct}% (missing lines: {missing[:6]})",
                     severity="Medium",
                 )
             if extras["tests_failed"] > 0:
@@ -343,15 +346,34 @@ def verify_finding_provenance(
     agent_key = _AGENT_KEY_BY_LABEL.get(raw_agent, raw_agent.lower().replace(" ", "_"))
     out, perm_violations = enforce_agent_permissions(agent_key, out, execution_telemetry)
 
-    fp = str(out.get("file_path") or "").strip()
+    fp = str(out.get("file_path") or "").replace("\\", "/").strip().lstrip("./")
+    if fp:
+        out["file_path"] = fp
     ln = out.get("line_number")
-    line_int = int(ln) if isinstance(ln, int) and ln > 0 else None
+    line_int: int | None = None
+    if ln is not None and not isinstance(ln, bool):
+        try:
+            parsed_ln = int(ln)
+            if parsed_ln > 0:
+                line_int = parsed_ln
+        except (TypeError, ValueError):
+            line_int = None
+    out["line_number"] = line_int
     claimed_tool = str(out.get("tool_name") or "llm-review").strip()
     claimed_rule = str(out.get("rule_id") or "").strip() or None
     claimed_ev_ids = {str(x).strip() for x in (out.get("evidence_ids") or []) if str(x).strip()}
 
     exists, actual_line = verify_file_and_line(workspace_dir, fp, line_int)
-    if not exists and fp:
+    deleted_diff_match = [
+        rec
+        for rec in evidence_store
+        if not exists
+        and fp
+        and rec.file_path == fp
+        and rec.tool_name == "diff-ast-engine"
+        and ((claimed_ev_ids and rec.evidence_id in claimed_ev_ids) or claimed_tool == "diff-ast-engine")
+    ]
+    if not exists and fp and not deleted_diff_match:
         out["verification_status"] = "Unverified"
         out["evidence_ids"] = []
         out["confidence"] = _clamp_confidence(out.get("confidence"), 0.25)
@@ -475,6 +497,12 @@ def check_finding_contradiction(finding: dict[str, Any], extras: dict[str, Any])
             and str(finding.get("tool_name") or "") in LLM_ONLY_TOOLS
         ):
             return f"Contradicted by full-file polyglot guard index: URL/HTTPS validation is implemented at line(s) {guards['https_enforcement']}."
+        if (
+            "citation_or_allowlist_set_check" in guards
+            and ("missing citation" in combined or "does not validate citation" in combined or "citation check is absent" in combined)
+            and str(finding.get("tool_name") or "") in LLM_ONLY_TOOLS
+        ):
+            return f"Contradicted by full-file polyglot guard index: citation/allowlist set check is implemented at line(s) {guards['citation_or_allowlist_set_check']}."
 
     return None
 

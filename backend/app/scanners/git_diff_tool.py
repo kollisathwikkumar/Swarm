@@ -6,9 +6,67 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from app.scanners.code_engines import extract_polyglot_file_facts
+from app.scanners.code_engines import extract_polyglot_file_facts, prioritize_repo_files
 from app.scanners.diff_engines import analyze_ast_and_contract_diff
 from app.scanners.tool_runner import run_command_capture
+
+_LOCKFILE_SUFFIXES = (
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "poetry.lock",
+    "uv.lock",
+    "Pipfile.lock",
+    "Cargo.lock",
+)
+
+
+def prioritized_diff_excerpt(
+    changed_files: list[dict[str, Any]],
+    fallback_diff_text: str = "",
+    *,
+    max_chars: int = 8000,
+) -> str:
+    """Order unified diff hunks so high-signal security/source files come before tests, configs, and lockfiles."""
+    by_path: dict[str, str] = {}
+    for cf in changed_files or []:
+        path = str(cf.get("path") or "").strip()
+        patch = str(cf.get("patch") or "").strip()
+        if path and patch:
+            by_path[path] = patch
+
+    if not by_path:
+        if not fallback_diff_text:
+            return ""
+        parsed = parse_unified_diff(fallback_diff_text)
+        for p in parsed:
+            if p.path and p.patch:
+                by_path[p.path] = p.patch
+
+    if not by_path:
+        return (fallback_diff_text or "")[:max_chars]
+
+    ordered = prioritize_repo_files(list(by_path.keys()))
+    non_locks = [p for p in ordered if not p.endswith(_LOCKFILE_SUFFIXES)]
+    locks = [p for p in ordered if p.endswith(_LOCKFILE_SUFFIXES)]
+
+    chunks: list[str] = []
+    used = 0
+    for path in non_locks + locks:
+        patch = by_path[path]
+        if used + len(patch) + 1 <= max_chars:
+            chunks.append(patch)
+            used += len(patch) + 1
+        elif used == 0:
+            chunks.append(patch[:max_chars])
+            used = max_chars
+            break
+        else:
+            remaining = max_chars - used
+            if remaining >= 300:
+                chunks.append(patch[:remaining] + "\n... [truncated]")
+            break
+    return "\n".join(chunks)
 
 
 @dataclass
@@ -150,9 +208,17 @@ async def collect_diff_context(
                 )
 
     git_stat = ""
-    if (workspace_dir / ".git").exists() and base_commit and target_commit not in ("WORKING_TREE", "STAGED", "UNSTAGED"):
+    if (workspace_dir / ".git").exists() and base_commit:
+        if target_commit in ("WORKING_TREE", "UNSTAGED"):
+            stat_cmd = ["git", "diff", "--stat", "HEAD"]
+        elif target_commit == "STAGED":
+            stat_cmd = ["git", "diff", "--cached", "--stat"]
+        elif base_commit == "EMPTY_TREE":
+            stat_cmd = ["git", "diff", "--stat", "4b825dc642cb6eb9a060e54bf8d69288fbee4904", target_commit]
+        else:
+            stat_cmd = ["git", "diff", "--stat", f"{base_commit}..{target_commit}"]
         res = await run_command_capture(
-            ["git", "diff", "--stat", f"{base_commit}..{target_commit}"],
+            stat_cmd,
             cwd=workspace_dir,
             timeout=30,
         )

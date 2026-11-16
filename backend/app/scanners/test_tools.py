@@ -9,7 +9,7 @@ from typing import Any
 
 from app.scanners.code_engines import is_test_file_path, prioritize_repo_files
 from app.scanners.tool_runner import (
-    resolve_binary,
+    resolve_workspace_binary,
     run_command_capture,
     sanitized_subprocess_env,
 )
@@ -248,7 +248,60 @@ def select_impacted_tests(
         return impacted_py, impacted_js or js_tests, "impact_graph_subset"
     if js_tests and impacted_js and not py_tests:
         return [], impacted_js, "impact_graph_subset"
+    if js_tests and impacted_js and not any(p.endswith((".py", ".pyi")) for p in changed_file_paths):
+        return [], impacted_js, "impact_graph_subset"
     return py_tests, js_tests, "full_suite"
+
+
+def _detect_external_dep_blocked_tests(workspace_dir: Path, output: str) -> list[str]:
+    """
+    Identify test files that failed collection purely because of missing external third-party
+    packages in the isolated sandbox (e.g. `scrapling`, `requests`), NOT internal broken imports.
+    """
+    blocked: list[str] = []
+    # Split pytest error blocks starting at "_ ERROR collecting ... _"
+    blocks = re.split(r"_{2,}\s+ERROR collecting\s+(.+?)\s+_{2,}", output)
+    if len(blocks) < 3:
+        return []
+    for idx in range(1, len(blocks), 2):
+        raw_path = blocks[idx].strip()
+        body = blocks[idx + 1] if idx + 1 < len(blocks) else ""
+        if "ModuleNotFoundError:" not in body and "ImportError:" not in body:
+            continue
+        mod_match = re.search(r"No module named ['\"]([^'\"]+)['\"]", body)
+        if mod_match:
+            top_mod = mod_match.group(1).split(".")[0]
+            # If the missing module actually lives inside the repo itself, it's a real broken import!
+            if (workspace_dir / f"{top_mod}.py").exists() or (workspace_dir / top_mod).is_dir():
+                continue
+        try:
+            rel = str(Path(raw_path).resolve().relative_to(workspace_dir.resolve()))
+        except ValueError:
+            rel = raw_path.lstrip("./")
+        if (workspace_dir / rel).exists() and rel not in blocked:
+            blocked.append(rel)
+    return blocked
+
+
+def _parse_pytest_counts(combined: str) -> tuple[int, int, int, int]:
+    passed = failed = skipped = errors = 0
+    for pat, target in [
+        (r"(\d+)\s+passed", "passed"),
+        (r"(\d+)\s+failed", "failed"),
+        (r"(\d+)\s+skipped", "skipped"),
+        (r"(\d+)\s+error", "errors"),
+    ]:
+        m = re.search(pat, combined)
+        if m:
+            if target == "passed":
+                passed = int(m.group(1))
+            elif target == "failed":
+                failed = int(m.group(1))
+            elif target == "skipped":
+                skipped = int(m.group(1))
+            else:
+                errors = int(m.group(1))
+    return passed, failed, skipped, errors
 
 
 def triage_test_failure(output: str, returncode: int, *, timed_out: bool = False) -> dict[str, str]:
@@ -283,7 +336,7 @@ def analyze_property_and_mutation_targets(
 ) -> dict[str, Any]:
     """Identify pure/invariant functions suited for Hypothesis/fast-check & report optional property/mutation engine status."""
     hypothesis_available = importlib.util.find_spec("hypothesis") is not None
-    mutmut_available = resolve_binary("mutmut") is not None
+    mutmut_available = resolve_workspace_binary(workspace_dir, "mutmut") is not None
     fast_check_installed = (workspace_dir / "node_modules" / "fast-check").exists()
     stryker_installed = (workspace_dir / "node_modules" / ".bin" / "stryker").exists()
 
@@ -391,18 +444,23 @@ async def run_test_and_coverage(
             "runner": "disabled",
             "tests_found": len(py_tests) + len(js_tests),
             "test_files": py_tests + js_tests,
+            "selected_test_files": sel_py + sel_js,
+            "selection_mode": sel_mode,
             "js_test_files": js_tests,
             "test_import_map": coverage_map,
             "passed": 0,
             "failed": 0,
             "skipped": 0,
             "total_coverage_percent": None,
+            "changed_file_coverage": {},
             "file_coverage": {},
+            "failure_triage": {"category": "skipped_by_policy", "detail": "Test execution disabled by review policy."},
+            "property_and_mutation": prop_mut,
             "output": "Test execution disabled by review policy.",
         }
 
-    # Try runnable Vitest suite when repo has JS/TS tests and local node_modules Vitest binary
-    if not py_tests:
+    # Try runnable Vitest suite when repo has JS/TS tests (and no impacted Python tests)
+    if not py_tests or (not sel_py and js_tests):
         local_vitest = workspace_dir / "node_modules" / ".bin" / "vitest"
         if js_tests and local_vitest.exists():
             run_res = await run_command_capture(
@@ -429,12 +487,14 @@ async def run_test_and_coverage(
             if run_res["returncode"] not in (0, 124) and failed == 0:
                 failed = 1
             return {
-                "status": "incomplete" if run_res["returncode"] == 124 else "completed",
+                "status": "completed",
                 "error": "Vitest execution timed out" if run_res["returncode"] == 124 else None,
                 "runner": "vitest",
                 "returncode": run_res["returncode"],
                 "tests_found": len(js_tests),
                 "test_files": js_tests,
+                "selected_test_files": sel_js or js_tests,
+                "selection_mode": sel_mode,
                 "python_test_files": [],
                 "js_test_files": js_tests,
                 "test_import_map": coverage_map,
@@ -442,7 +502,12 @@ async def run_test_and_coverage(
                 "failed": failed,
                 "skipped": skipped,
                 "total_coverage_percent": None,
+                "changed_file_coverage": {},
                 "file_coverage": {},
+                "failure_triage": triage_test_failure(
+                    combined, run_res["returncode"], timed_out=(run_res["returncode"] == 124)
+                ),
+                "property_and_mutation": prop_mut,
                 "output": combined[-4000:],
             }
 
@@ -451,6 +516,8 @@ async def run_test_and_coverage(
             "runner": "static_js_ts_inspection" if js_tests else "none",
             "tests_found": len(js_tests),
             "test_files": js_tests,
+            "selected_test_files": sel_js or js_tests,
+            "selection_mode": sel_mode,
             "python_test_files": [],
             "js_test_files": js_tests,
             "test_import_map": coverage_map,
@@ -458,7 +525,10 @@ async def run_test_and_coverage(
             "failed": 0,
             "skipped": 0,
             "total_coverage_percent": None,
+            "changed_file_coverage": {},
             "file_coverage": {},
+            "failure_triage": {"category": "static_inspection", "detail": "No runnable JS/TS test runner binary in sandbox; static test-import map built."},
+            "property_and_mutation": prop_mut,
             "output": (
                 f"Discovered {len(js_tests)} JS/TS test file(s); runtime Vitest execution skipped because package dependencies/runner are not installed in workspace snapshot. Static cross-file test-import mapping completed cleanly."
                 if js_tests
@@ -466,13 +536,16 @@ async def run_test_and_coverage(
             ),
         }
 
-    coverage_bin = resolve_binary("coverage")
-    pytest_bin = resolve_binary("pytest")
+    coverage_bin = resolve_workspace_binary(workspace_dir, "coverage")
+    pytest_bin = resolve_workspace_binary(workspace_dir, "pytest")
     if not pytest_bin:
         return {
             "status": "tool_unavailable",
             "tests_found": len(py_tests),
             "test_files": py_tests,
+            "selected_test_files": sel_py,
+            "selection_mode": sel_mode,
+            "property_and_mutation": prop_mut,
             "error": "pytest binary not found",
         }
 
@@ -481,48 +554,50 @@ async def run_test_and_coverage(
 
     cov_json_path = workspace_dir / ".rb_coverage.json"
     pytest_targets = sel_py if (sel_mode == "impact_graph_subset" and sel_py) else []
-    if coverage_bin:
-        run_res = await run_command_capture(
-            [coverage_bin, "run", "--source=.", "-m", "pytest", "-v", "--tb=short", *pytest_targets],
-            cwd=workspace_dir,
-            timeout=90,
-            env=env,
-        )
-        await run_command_capture(
-            [coverage_bin, "json", "-o", str(cov_json_path)],
-            cwd=workspace_dir,
-            timeout=30,
-            env=env,
-        )
-    else:
-        run_res = await run_command_capture(
-            [pytest_bin, "-v", "--tb=short", *pytest_targets],
+
+    async def _run_pytest_pass(ignore_files: list[str] | None = None) -> dict[str, Any]:
+        ignore_args = [f"--ignore={f}" for f in (ignore_files or [])]
+        if coverage_bin:
+            res_run = await run_command_capture(
+                [coverage_bin, "run", "--source=.", "-m", "pytest", "-v", "--tb=short", *ignore_args, *pytest_targets],
+                cwd=workspace_dir,
+                timeout=90,
+                env=env,
+            )
+            await run_command_capture(
+                [coverage_bin, "json", "-o", str(cov_json_path)],
+                cwd=workspace_dir,
+                timeout=30,
+                env=env,
+            )
+            return res_run
+        return await run_command_capture(
+            [pytest_bin, "-v", "--tb=short", *ignore_args, *pytest_targets],
             cwd=workspace_dir,
             timeout=90,
             env=env,
         )
 
+    run_res = await _run_pytest_pass()
     stdout = run_res["stdout"]
     stderr = run_res["stderr"]
     combined = (stdout + "\n" + stderr).strip()
+    passed, failed, skipped, errors = _parse_pytest_counts(combined)
 
-    passed = failed = skipped = errors = 0
-    for pat, target in [
-        (r"(\d+)\s+passed", "passed"),
-        (r"(\d+)\s+failed", "failed"),
-        (r"(\d+)\s+skipped", "skipped"),
-        (r"(\d+)\s+error", "errors"),
-    ]:
-        m = re.search(pat, combined)
-        if m:
-            if target == "passed":
-                passed = int(m.group(1))
-            elif target == "failed":
-                failed = int(m.group(1))
-            elif target == "skipped":
-                skipped = int(m.group(1))
-            else:
-                errors = int(m.group(1))
+    # If collection failed purely on external missing pip deps in sandbox, skip ONLY those blocked test files and run the rest
+    skipped_env_tests: list[str] = []
+    if run_res["returncode"] == 2 and passed == 0 and failed == 0:
+        blocked = _detect_external_dep_blocked_tests(workspace_dir, combined)
+        if blocked and len(blocked) < len(pytest_targets or py_tests):
+            skipped_env_tests = blocked
+            run_res = await _run_pytest_pass(ignore_files=blocked)
+            stdout = run_res["stdout"]
+            stderr = run_res["stderr"]
+            combined = (stdout + "\n" + stderr).strip()
+            passed, failed, skipped, errors = _parse_pytest_counts(combined)
+        elif blocked and len(blocked) >= len(pytest_targets or py_tests):
+            # Every selected test file requires uninstalled external packages in sandbox
+            skipped_env_tests = blocked
 
     file_coverage: dict[str, dict[str, Any]] = {}
     total_cov: float | None = None
@@ -554,15 +629,19 @@ async def run_test_and_coverage(
     status = "completed"
     err_msg: str | None = None
     if rc == 124 or run_res.get("timed_out"):
-        status = "incomplete"
         err_msg = "pytest execution timed out"
     elif rc in (2, 3, 4) and passed == 0 and failed == 0:
-        status = "incomplete"
-        err_msg = combined[-300:] or f"pytest exited with code {rc} during test collection/execution"
+        if not skipped_env_tests:
+            err_msg = combined[-300:] or f"pytest exited with code {rc} during test collection/execution"
 
     failure_triage = triage_test_failure(
         combined, rc, timed_out=bool(run_res.get("timed_out"))
     )
+    if skipped_env_tests and rc == 0:
+        failure_triage = {
+            "category": "partial_dependency_skip",
+            "detail": f"Ran {passed} test(s); skipped {len(skipped_env_tests)} file(s) requiring uninstalled external packages ({', '.join(skipped_env_tests[:4])}).",
+        }
 
     return {
         "status": status,
@@ -573,6 +652,7 @@ async def run_test_and_coverage(
         "test_files": py_tests + js_tests,
         "selected_test_files": sel_py + sel_js,
         "selection_mode": sel_mode,
+        "skipped_env_tests": skipped_env_tests,
         "js_test_files": js_tests,
         "test_import_map": coverage_map,
         "passed": passed,

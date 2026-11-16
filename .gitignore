@@ -11,6 +11,8 @@
 *.sqlite3
 
 # Runtime Workspaces & Caches
+.venv/
+.venv
 .reviewboard_workspaces/
 backend/.reviewboard_workspaces/
 backend/.venv/

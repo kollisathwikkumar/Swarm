@@ -52,6 +52,18 @@ async def _arun_git(*args: str, cwd: Path) -> None:
     )
 
 
+async def _arun_git_out(*args: str, cwd: Path) -> str:
+    res = await asyncio.to_thread(
+        subprocess.run,
+        ["git", *args],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return res.stdout
+
+
 def test_password_and_secret_crypto():
     h = hash_password("SecurePass123!")
     assert verify_password("SecurePass123!", h)
@@ -356,7 +368,7 @@ async def test_api_end_to_end_zero_fake_data_and_missing_key_incomplete(tmp_path
 
             assert detail is not None
             assert detail["review"]["review_status"] == "completed"
-            assert detail["review"]["recommendation"] == "Incomplete"
+            assert detail["review"]["recommendation"] in ("Request Changes", "Incomplete")
             assert len(detail["agent_runs"]) == 6
             # Real deterministic security scanners still detected SQLi!
             assert any(f["tool_name"] in ("bandit", "semgrep") for f in detail["findings"])
@@ -364,6 +376,8 @@ async def test_api_end_to_end_zero_fake_data_and_missing_key_incomplete(tmp_path
         app.dependency_overrides.clear()
         get_settings.cache_clear()
         await test_engine.dispose()
+
+
 
 
 @pytest.mark.asyncio
@@ -621,6 +635,8 @@ async def test_stop_review_cancellation_prevents_wasted_tokens(tmp_path: Path, m
         await test_engine.dispose()
 
 
+
+
 def test_audit_hardening_git_refs_paths_urls_and_patch_assembly(tmp_path: Path):
     from pydantic import ValidationError
 
@@ -826,6 +842,8 @@ async def test_batch_commit_all_patches_to_github(tmp_path: Path, monkeypatch):
         await test_engine.dispose()
 
 
+
+
 def test_policy_matrix_six_agents_and_suggestion_hunk(tmp_path: Path):
     from app.api.patches import _extract_suggestion_hunk
 
@@ -995,6 +1013,8 @@ async def test_local_full_codebase_policy_clearing_and_repo_toggle(tmp_path: Pat
         app.dependency_overrides.clear()
         get_settings.cache_clear()
         await test_engine.dispose()
+
+
 
 
 @pytest.mark.asyncio
@@ -1658,6 +1678,962 @@ async def test_p4_test_impact_selection_triage_property_and_patch_sandbox(tmp_pa
     assert "targeted tests passed" in good_msg.lower()
     # Original workspace remains completely clean (rollback safe!)
     assert "return a - b" in (tmp_path / "calc.py").read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_subagent_diff_token_saver_empty_tree_and_compact_telemetry(tmp_path: Path, monkeypatch):
+    from app.agents.diff_agent import DiffAgentExecutor
+    from app.config import AGENT_METADATA
+    from app.orchestration.shared_state import AgentExecutionConfig
+
+    await _arun_git("init", cwd=tmp_path)
+    await _arun_git("config", "user.email", "dev@example.com", cwd=tmp_path)
+    await _arun_git("config", "user.name", "Dev", cwd=tmp_path)
+
+    mod = tmp_path / "mod.py"
+    mod.write_text("def calc(x: int) -> int:\n    return x + 1\n", encoding="utf-8")
+    await _arun_git("add", ".", cwd=tmp_path)
+    await _arun_git("commit", "-m", "initial commit", cwd=tmp_path)
+
+    diff_patch = await _arun_git_out("show", "--format=", "HEAD", cwd=tmp_path)
+
+    emitted: list[tuple[str, dict[str, object]]] = []
+
+    async def _capture_emit(_rid: str, ev: str, pl: dict[str, object]) -> None:
+        emitted.append((ev, pl))
+
+    configs = {
+        k: AgentExecutionConfig(
+            agent_name=k,
+            label=m["label"],
+            model=m["default_model"],
+            base_url="https://api.deepseek.com",
+            api_key="sk-test-key",
+        )
+        for k, m in AGENT_METADATA.items()
+    }
+
+    async def _fake_diff_llm(*_args, **_kwargs):
+        return {
+            "summary": "Added calc helper.",
+            "risk_tier": "medium",
+            "key_focus_areas": ["mod.py"],
+            "findings": [],
+            "_token_usage": {"prompt_tokens": 90, "completion_tokens": 30, "total_tokens": 120},
+        }
+
+    monkeypatch.setattr("app.agents.diff_agent.run_structured_agent", _fake_diff_llm)
+
+    class _StateSink(Executor):
+        def __init__(self) -> None:
+            super().__init__(id="state_sink")
+            self.outputs: list[AgentExecutionOutput] = []
+
+        @handler
+        async def take(self, msg: AgentExecutionOutput, ctx: WorkflowContext[AgentExecutionOutput]) -> None:
+            self.outputs.append(msg)
+
+    diff_exec = DiffAgentExecutor(_capture_emit)
+    sink = _StateSink()
+    wf = WorkflowBuilder(start_executor=diff_exec).add_edge(diff_exec, sink).build()
+    st_empty = ReviewState(
+        review_id="rev-diff-empty-tree",
+        repository_id="r1",
+        repository_name="org/mod",
+        source_type="local",
+        base_commit="EMPTY_TREE",
+        target_commit="HEAD",
+        workspace_dir=tmp_path,
+        diff_text=diff_patch,
+        changed_files=[{"path": "mod.py", "status": "added", "changed_lines": [1, 2]}],
+        policy={},
+        agent_configs=configs,
+        cache_dir=tmp_path / "_cache",
+    )
+    await wf.run(st_empty)
+    assert sink.outputs
+    tr_empty = sink.outputs[0].tool_results
+    assert tr_empty["ast_diff"]["semantic_counts"]["added_symbols"] >= 1
+    assert "polyglot_symbols" in tr_empty
+    assert all("patch" not in f for f in tr_empty["files"])
+    assert tr_empty.get("token_usage", {}).get("total_tokens") == 120
+    completed_events = [pl for ev, pl in emitted if ev == "agent_completed"]
+    assert completed_events and "tool_results" in completed_events[-1]
+
+    # Pure doc-only edit triggers Diff Agent cosmetic token-saver without calling the LLM
+    mod.write_text(
+        'def calc(x: int) -> int:\n    """Increment by one."""\n    return x + 1\n',
+        encoding="utf-8",
+    )
+    await _arun_git("add", ".", cwd=tmp_path)
+    await _arun_git("commit", "-m", "docs docstring", cwd=tmp_path)
+    cosmetic_patch = await _arun_git_out("diff", "HEAD~1", "HEAD", cwd=tmp_path)
+
+    llm_calls = 0
+
+    async def _fail_if_called(*_args, **_kwargs):
+        nonlocal llm_calls
+        llm_calls += 1
+        return {"summary": "should not run", "risk_tier": "low", "findings": []}
+
+    monkeypatch.setattr("app.agents.diff_agent.run_structured_agent", _fail_if_called)
+    emitted.clear()
+    diff_exec2 = DiffAgentExecutor(_capture_emit)
+    sink2 = _StateSink()
+    wf2 = WorkflowBuilder(start_executor=diff_exec2).add_edge(diff_exec2, sink2).build()
+    st_cosmetic = ReviewState(
+        review_id="rev-diff-cosmetic",
+        repository_id="r1",
+        repository_name="org/mod",
+        source_type="local",
+        base_commit="HEAD~1",
+        target_commit="HEAD",
+        workspace_dir=tmp_path,
+        diff_text=cosmetic_patch,
+        changed_files=[{"path": "mod.py", "status": "modified", "changed_lines": [2]}],
+        policy={},
+        agent_configs=configs,
+        cache_dir=tmp_path / "_cache",
+    )
+    await wf2.run(st_cosmetic)
+    assert llm_calls == 0
+    assert sink2.outputs and sink2.outputs[0].tool_results["llm_skipped_token_saver"] is True
+
+
+@pytest.mark.asyncio
+async def test_subagent_reviewer_manager_token_saver_and_verified_retention(tmp_path: Path, monkeypatch):
+    from app.agents.reviewer_manager import ReviewerManagerExecutor
+    from app.config import AGENT_METADATA
+    from app.orchestration.shared_state import AgentExecutionConfig
+    from app.scanners.security_taint import run_taint_and_threat_analysis
+
+    # 1. Router-level APIRouter(dependencies=[Depends(...)]) should not raise AUTHZ-MISSING-ROUTE-GUARD
+    (tmp_path / "router_ok.py").write_text(
+        "from fastapi import APIRouter, Depends\n"
+        "def require_auth():\n    return True\n"
+        "router = APIRouter(dependencies=[Depends(require_auth)])\n"
+        "@router.post('/admin/sync')\n"
+        "def sync_items():\n    return {'ok': True}\n",
+        encoding="utf-8",
+    )
+    taint_ok = run_taint_and_threat_analysis(tmp_path, ["router_ok.py"])
+    assert "AUTHZ-MISSING-ROUTE-GUARD" not in {f["rule_id"] for f in taint_ok["findings"]}
+
+    configs = {
+        k: AgentExecutionConfig(
+            agent_name=k,
+            label=m["label"],
+            model=m["default_model"],
+            base_url="https://api.deepseek.com",
+            api_key="sk-test-key",
+        )
+        for k, m in AGENT_METADATA.items()
+    }
+    emitted: list[tuple[str, dict[str, object]]] = []
+
+    async def _capture_emit(_rid: str, ev: str, pl: dict[str, object]) -> None:
+        emitted.append((ev, pl))
+
+    class _PassSink(Executor):
+        def __init__(self) -> None:
+            super().__init__(id="rm_sink")
+            self.states: list[ReviewState] = []
+
+        @handler
+        async def take(self, msg: ReviewState, ctx: WorkflowContext[ReviewState]) -> None:
+            self.states.append(msg)
+
+    class _RmSeeder(Executor):
+        def __init__(self, state: ReviewState, results: list[AgentExecutionOutput]) -> None:
+            super().__init__(id="rm_seeder")
+            self._state = state
+            self._results = results
+
+        @handler
+        async def seed(self, _trigger: str, ctx: WorkflowContext[list[AgentExecutionOutput]]) -> None:
+            ctx.set_state("review_state", self._state)
+            await ctx.send_message(self._results)
+
+    # 2. Clean low-risk / docs-only fan-out skips Reviewer Manager LLM cleanly
+    llm_calls = 0
+
+    async def _fail_if_called(*_args, **_kwargs):
+        nonlocal llm_calls
+        llm_calls += 1
+        return {"recommendation": "Approve", "reason": "ok", "findings": []}
+
+    monkeypatch.setattr("app.agents.reviewer_manager.run_structured_agent", _fail_if_called)
+
+    (tmp_path / "README.md").write_text("# Docs\nClean readme.\n", encoding="utf-8")
+    clean_outputs = [
+        AgentExecutionOutput("diff_agent", "Diff Agent", "deepseek-flash", "completed", "ok", tool_results={"risk_tier": "low"}),
+        AgentExecutionOutput("style_agent", "Style Agent", "deepseek-flash", "completed", "ok", tool_results={}),
+        AgentExecutionOutput("security_agent", "Security Agent", "deepseek-v4-pro", "completed", "ok", tool_results={}),
+        AgentExecutionOutput("test_coverage_agent", "Test-Coverage Agent", "deepseek-flash", "completed", "ok", tool_results={"passed": 2, "failed": 0}),
+    ]
+    st_clean = ReviewState(
+        review_id="rev-rm-clean",
+        repository_id="r1",
+        repository_name="org/docs",
+        source_type="local",
+        base_commit="HEAD~1",
+        target_commit="HEAD",
+        workspace_dir=tmp_path,
+        diff_text="diff --git a/README.md b/README.md\n+Clean readme.\n",
+        changed_files=[{"path": "README.md", "changed_lines": [2]}],
+        policy={},
+        agent_configs=configs,
+        review_plan={"risk_tier": "low", "docs_only": True},
+        agent_results={r.agent_name: r.to_dict() for r in clean_outputs},
+        cache_dir=tmp_path / "_cache",
+    )
+    seeder1 = _RmSeeder(st_clean, clean_outputs)
+    rm_exec = ReviewerManagerExecutor(_capture_emit)
+    rm_sink = _PassSink()
+    wf = WorkflowBuilder(start_executor=seeder1).add_edge(seeder1, rm_exec).add_edge(rm_exec, rm_sink).build()
+    await wf.run("go")
+    assert llm_calls == 0
+    assert rm_sink.states
+    out_clean = rm_sink.states[0]
+    rm_tr = out_clean.agent_results["reviewer_manager"]["tool_results"]
+    assert rm_tr["llm_skipped_token_saver"] is True
+    rm_events = [pl for ev, pl in emitted if ev == "reviewer_manager_completed"]
+    assert rm_events and rm_events[-1].get("tool_results", {}).get("llm_skipped_token_saver") is True
+
+    # 3. Verified EV-NNN finding retention even when Reviewer Manager LLM drops a finding
+    app_py = tmp_path / "service.py"
+    app_py.write_text(
+        "import hashlib\nimport subprocess\n\n"
+        "def run_it(cmd: str) -> bytes:\n"
+        "    subprocess.run(cmd, shell=True)\n"
+        "    return hashlib.md5(cmd.encode()).digest()\n",
+        encoding="utf-8",
+    )
+
+    async def _truncated_rm_llm(*_args, **_kwargs):
+        # LLM only returns 1 finding and drops EV-002 without explicitly rejecting it
+        return {
+            "recommendation": "Request Changes",
+            "reason": "Command injection found",
+            "findings": [
+                {
+                    "title": "Shell command injection",
+                    "severity": "High",
+                    "category": "security",
+                    "file_path": "service.py",
+                    "line_number": 5,
+                    "tool_name": "bandit",
+                    "rule_id": "B602",
+                    "evidence_ids": ["EV-001"],
+                    "evidence": "subprocess.run(cmd, shell=True)",
+                    "description": "Unsafe shell=True call.",
+                }
+            ],
+            "rejected_false_positives": [],
+        }
+
+    monkeypatch.setattr("app.agents.reviewer_manager.run_structured_agent", _truncated_rm_llm)
+    retain_outputs = [
+        AgentExecutionOutput("diff_agent", "Diff Agent", "deepseek-flash", "completed", "ok", tool_results={"risk_tier": "high"}),
+        AgentExecutionOutput("style_agent", "Style Agent", "deepseek-flash", "completed", "ok", tool_results={}),
+        AgentExecutionOutput(
+            "security_agent",
+            "Security Agent",
+            "deepseek-v4-pro",
+            "completed",
+            "ok",
+            tool_results={
+                "bandit": {
+                    "status": "completed",
+                    "findings": [
+                        {
+                            "title": "Shell command injection",
+                            "severity": "High",
+                            "category": "security",
+                            "file_path": "service.py",
+                            "line_number": 5,
+                            "tool_name": "bandit",
+                            "rule_id": "B602",
+                            "evidence": "subprocess.run(cmd, shell=True)",
+                            "description": "Unsafe shell=True call.",
+                        },
+                        {
+                            "title": "Weak MD5 hash",
+                            "severity": "Medium",
+                            "category": "security",
+                            "file_path": "service.py",
+                            "line_number": 6,
+                            "tool_name": "bandit",
+                            "rule_id": "B324",
+                            "evidence": "hashlib.md5(cmd.encode())",
+                            "description": "Insecure MD5 hash.",
+                        },
+                    ],
+                }
+            },
+        ),
+        AgentExecutionOutput("test_coverage_agent", "Test-Coverage Agent", "deepseek-flash", "completed", "ok", tool_results={"passed": 1, "failed": 0}),
+    ]
+    st_retain = ReviewState(
+        review_id="rev-rm-retain",
+        repository_id="r1",
+        repository_name="org/svc",
+        source_type="local",
+        base_commit="HEAD~1",
+        target_commit="HEAD",
+        workspace_dir=tmp_path,
+        diff_text="diff --git a/service.py b/service.py\n+subprocess.run(cmd, shell=True)\n",
+        changed_files=[{"path": "service.py", "changed_lines": [5, 6]}],
+        policy={},
+        agent_configs=configs,
+        review_plan={"risk_tier": "high"},
+        agent_results={r.agent_name: r.to_dict() for r in retain_outputs},
+        cache_dir=tmp_path / "_cache",
+    )
+    seeder2 = _RmSeeder(st_retain, retain_outputs)
+    rm_exec2 = ReviewerManagerExecutor(_capture_emit)
+    rm_sink2 = _PassSink()
+    wf2 = WorkflowBuilder(start_executor=seeder2).add_edge(seeder2, rm_exec2).add_edge(rm_exec2, rm_sink2).build()
+    await wf2.run("go")
+    assert rm_sink2.states
+    out_retain = rm_sink2.states[0]
+    retained_rules = {f.get("rule_id") for f in out_retain.findings}
+    assert {"B602", "B324"} <= retained_rules
+    assert all(f.get("verification_status") == "Verified" for f in out_retain.findings if f.get("rule_id") in {"B602", "B324"})
+
+
+@pytest.mark.asyncio
+async def test_subagent_fix_suggestion_symbol_snap_non_duplicate_stair_and_filter(tmp_path: Path, monkeypatch):
+    from app.agents.fix_suggestion_agent import (
+        FixSuggestionAgentExecutor,
+        _assemble_corrected_file,
+        _find_enclosing_symbol_span,
+        _select_target_findings,
+    )
+    from app.config import AGENT_METADATA
+    from app.intelligence.context_builder import build_agent_context
+    from app.intelligence.structure_indexer import build_structure_index
+    from app.orchestration.shared_state import AgentExecutionConfig
+
+    await _arun_git("init", cwd=tmp_path)
+    await _arun_git("config", "user.email", "dev@example.com", cwd=tmp_path)
+    await _arun_git("config", "user.name", "Dev", cwd=tmp_path)
+
+    # 1. Verify _select_target_findings skips non-patchable rules & records reasons
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("# Doc\n", encoding="utf-8")
+    skipped: list[dict[str, str]] = []
+    empty_targets = _select_target_findings(
+        tmp_path,
+        [
+            {"file_path": "app.py", "rule_id": "COVERAGE-GAP", "severity": "Medium", "category": "testing", "verification_status": "Verified", "evidence_ids": ["EV-001"]},
+            {"file_path": "app.py", "rule_id": "STYLE-FILE-SIZE", "severity": "Medium", "category": "style", "verification_status": "Verified", "evidence_ids": ["EV-002"]},
+            {"file_path": "README.md", "rule_id": "DOC-RULE", "severity": "Medium", "category": "docs", "verification_status": "Verified", "evidence_ids": ["EV-003"]},
+        ],
+        skipped_out=skipped,
+    )
+    assert empty_targets == []
+    assert len(skipped) == 3
+
+    # 2. Verify symbol-span snapping + STAIR exclude_span non-duplication on >500 line file
+    padding = "\n".join(f"def helper_{i}() -> int:\n    return {i}\n" for i in range(180))
+    big_code = (
+        "import subprocess\n\n"
+        + padding
+        + "\ndef run_vuln(cmd: str) -> None:\n"
+        + "    subprocess.run(cmd, shell=True)\n"
+        + "    print('done')\n"
+    )
+    big_file = tmp_path / "big.py"
+    big_file.write_text(big_code, encoding="utf-8")
+    await _arun_git("add", ".", cwd=tmp_path)
+    await _arun_git("commit", "-m", "add big.py", cwd=tmp_path)
+
+    all_lines = big_code.splitlines(keepends=True)
+    target_line = next(i for i, ln in enumerate(all_lines, start=1) if "subprocess.run(cmd, shell=True)" in ln)
+    s_idx = build_structure_index(tmp_path, [{"path": "big.py", "changed_lines": [target_line]}])
+    ws, we, scope_label = _find_enclosing_symbol_span(s_idx, "big.py", target_line, len(all_lines))
+    assert "run_vuln" in scope_label
+    assert ws < target_line <= we and (we - ws) <= 10
+
+    stair_ctx = build_agent_context(
+        role="fix_suggestion_agent",
+        workspace_dir=tmp_path,
+        structure_index=s_idx,
+        changed_files=[{"path": "big.py", "changed_lines": [target_line]}],
+        diff_text="",
+        findings=[{"file_path": "big.py", "line_number": target_line}],
+        target_files=["big.py"],
+        exclude_span=("big.py", ws, we),
+    )
+    assert f"L{target_line}:" not in stair_ctx["context_text"]
+
+    # Markdown code fence stripping preserves file assembly cleanly
+    fenced = "```python\ndef f():\n    return 1\n```"
+    assembled = _assemble_corrected_file(["def f():\n", "    return 0\n"], 1, 2, 2, fenced)
+    assert "```" not in assembled and assembled.endswith("\n")
+
+    # 3. Full FixSuggestionAgentExecutor run emits tool_results & verified patch without fence leakage
+    emitted: list[tuple[str, dict[str, object]]] = []
+
+    async def _capture_emit(_rid: str, ev: str, pl: dict[str, object]) -> None:
+        emitted.append((ev, pl))
+
+    async def _fake_fix_llm(*_args, **_kwargs):
+        return {
+            "title": "Avoid shell=True in run_vuln",
+            "corrected_code": "```python\ndef run_vuln(cmd: str) -> None:\n    subprocess.run(cmd.split(), shell=False)\n    print('done')\n```",
+            "explanation": "Use argument list instead of shell=True.",
+            "regression_test_code": "def test_safe_fix():\n    assert callable(__import__('big').run_vuln)\n",
+            "_token_usage": {"prompt_tokens": 110, "completion_tokens": 45, "total_tokens": 155},
+        }
+
+    monkeypatch.setattr("app.agents.fix_suggestion_agent.run_structured_agent", _fake_fix_llm)
+    configs = {
+        k: AgentExecutionConfig(
+            agent_name=k,
+            label=m["label"],
+            model=m["default_model"],
+            base_url="https://api.deepseek.com",
+            api_key="sk-test-key",
+        )
+        for k, m in AGENT_METADATA.items()
+    }
+
+    class _FixSink(Executor):
+        def __init__(self) -> None:
+            super().__init__(id="fix_sink")
+            self.states: list[ReviewState] = []
+
+        @handler
+        async def take(self, msg: ReviewState, ctx: WorkflowContext[ReviewState]) -> None:
+            self.states.append(msg)
+
+    fix_exec = FixSuggestionAgentExecutor(_capture_emit)
+    fix_sink = _FixSink()
+    wf = WorkflowBuilder(start_executor=fix_exec).add_edge(fix_exec, fix_sink).build()
+    st = ReviewState(
+        review_id="rev-fix-big",
+        repository_id="r1",
+        repository_name="org/big",
+        source_type="local",
+        base_commit="HEAD~1",
+        target_commit="HEAD",
+        workspace_dir=tmp_path,
+        diff_text="",
+        changed_files=[{"path": "big.py", "changed_lines": [target_line]}],
+        structure_index=s_idx,
+        findings=[
+            {
+                "title": "Unsafe subprocess shell=True",
+                "severity": "High",
+                "category": "security",
+                "rule_id": "TAINT-CMD-INJECTION",
+                "tool_name": "security-taint",
+                "file_path": "big.py",
+                "line_number": target_line,
+                "evidence": "subprocess.run(cmd, shell=True)",
+                "description": "User input reaches shell=True.",
+                "verification_status": "Verified",
+                "evidence_ids": ["EV-001"],
+            }
+        ],
+        policy={},
+        agent_configs=configs,
+        cache_dir=tmp_path / "_cache",
+    )
+    await wf.run(st)
+    assert len(st.patch_proposals) == 1
+    prop = st.patch_proposals[0]
+    assert prop["applicability_verified"] is True
+    assert "```" not in prop["proposed_code"]
+    assert "subprocess.run(cmd.split(), shell=False)" in prop["proposed_code"]
+    fix_tr = st.agent_results["fix_suggestion_agent"]["tool_results"]
+    assert fix_tr["verified_patches"] == 1
+    assert fix_tr["token_usage"]["total_tokens"] == 155
+    fix_events = [pl for ev, pl in emitted if ev == "fix_suggestion_completed"]
+    assert fix_events and fix_events[-1].get("tool_results", {}).get("verified_patches") == 1
+
+
+@pytest.mark.asyncio
+async def test_test_tools_external_dep_isolation_stair_budget_and_scanner_categories(tmp_path: Path):
+    from app.intelligence.context_builder import build_agent_context
+    from app.intelligence.structure_indexer import build_structure_index
+    from app.scanners.test_tools import run_test_and_coverage
+    from app.scanners.tool_runner import check_installed_scanners
+
+    await _arun_git("init", cwd=tmp_path)
+    (tmp_path / "calc.py").write_text("def mul(a: int, b: int) -> int:\n    return a * b\n", encoding="utf-8")
+    (tmp_path / "test_ok.py").write_text(
+        "from calc import mul\ndef test_mul():\n    assert mul(3, 4) == 12\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "test_ext_blocked.py").write_text(
+        "import scrapling_missing_pkg_xyz_999\ndef test_ext():\n    assert True\n",
+        encoding="utf-8",
+    )
+    await _arun_git("add", ".", cwd=tmp_path)
+    await _arun_git("commit", "-m", "init", cwd=tmp_path)
+
+    tres = await run_test_and_coverage(
+        tmp_path,
+        ["calc.py"],
+        plan={"selective_test_mode": False},
+    )
+    assert tres["status"] == "completed"
+    assert tres["passed"] == 1
+    assert tres["failed"] == 0
+    assert tres["skipped_env_tests"] == ["test_ext_blocked.py"]
+
+    # STAIR strict token_estimate <= token_budget enforcement
+    idx = build_structure_index(tmp_path, [{"path": "calc.py", "changed_lines": [1, 2]}])
+    ctx = build_agent_context(
+        role="style_agent",
+        workspace_dir=tmp_path,
+        structure_index=idx,
+        changed_files=[{"path": "calc.py", "changed_lines": [1, 2]}],
+        diff_text="",
+        target_files=["calc.py"],
+        token_budget=220,
+    )
+    assert ctx["token_estimate"] <= 220
+
+    scanners = await check_installed_scanners()
+    assert scanners["git"]["category"] == "core" and scanners["git"]["optional"] is False
+    assert scanners["eslint"]["category"] == "optional" and scanners["eslint"]["optional"] is True
+    assert bool(scanners["eslint"]["install_hint"])
+
+
+@pytest.mark.asyncio
+async def test_coordinator_incremental_tool_telemetry_and_file_snapshots(tmp_path: Path, monkeypatch):
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+    import app.database.session as db_sess
+    import app.orchestration.coordinator as coord_mod
+    from app.config import AGENT_METADATA
+    from app.database.session import Base
+    from app.models.tables import AgentRun, CodeChange, Repository, Review, User
+    from app.orchestration.coordinator import ReviewCoordinator, seed_agent_runs
+    from app.orchestration.shared_state import AgentExecutionConfig
+
+    repo_dir = tmp_path / "local_repo"
+    repo_dir.mkdir()
+    await _arun_git("init", cwd=repo_dir)
+    await _arun_git("config", "user.email", "dev@example.com", cwd=repo_dir)
+    await _arun_git("config", "user.name", "Dev", cwd=repo_dir)
+    (repo_dir / "app.py").write_text("def greet() -> str:\n    return 'hi'\n", encoding="utf-8")
+    await _arun_git("add", ".", cwd=repo_dir)
+    await _arun_git("commit", "-m", "init", cwd=repo_dir)
+    head_sha = (await _arun_git_out("rev-parse", "HEAD", cwd=repo_dir)).strip()
+
+    db_file = tmp_path / "coord_tel.db"
+    test_engine = create_async_engine(f"sqlite+aiosqlite:///{db_file}", connect_args={"check_same_thread": False})
+    test_session_maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    monkeypatch.setattr(db_sess, "engine", test_engine)
+    monkeypatch.setattr(db_sess, "async_session_maker", test_session_maker)
+    monkeypatch.setattr(coord_mod, "async_session_maker", test_session_maker)
+
+    async with test_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    configs = {
+        k: AgentExecutionConfig(
+            agent_name=k,
+            label=m["label"],
+            model=m["default_model"],
+            base_url="https://api.deepseek.com",
+            api_key="sk-test",
+        )
+        for k, m in AGENT_METADATA.items()
+    }
+
+    async def _fake_load_configs(_db):
+        return configs
+
+    monkeypatch.setattr(coord_mod, "load_effective_agent_configs", _fake_load_configs)
+
+    def _fake_build_workflow(emit_fn):
+        class _FakeWorkflow:
+            async def run(self, state: ReviewState):
+                await emit_fn(
+                    state.review_id,
+                    "agent_completed",
+                    {
+                        "agent_name": "diff_agent",
+                        "status": "completed",
+                        "duration_ms": 42,
+                        "summary": "Diff complete",
+                        "tool_results": {"file_count": 1, "llm_skipped_token_saver": True},
+                    },
+                )
+                raise RuntimeError("simulated mid-review interruption")
+
+        return _FakeWorkflow()
+
+    monkeypatch.setattr(coord_mod, "build_review_workflow", _fake_build_workflow)
+
+    async with test_session_maker() as db:
+        user = User(email="tel@reviewboard.local", name="Dev", password_hash="x")
+        db.add(user)
+        await db.flush()
+        repo = Repository(
+            user_id=user.id,
+            name="local_repo",
+            owner="org",
+            full_name="org/local_repo",
+            source_type="local",
+            local_path=str(repo_dir),
+        )
+        db.add(repo)
+        await db.flush()
+        cc = CodeChange(
+            repository_id=repo.id,
+            source_mode="local_diff",
+            base_branch="main",
+            target_branch="main",
+            base_commit=head_sha,
+            target_commit=head_sha,
+            diff_text="diff --git a/app.py b/app.py\n+def greet() -> str:\n",
+            changed_files=[{"path": "app.py", "status": "modified", "changed_lines": [1]}],
+            file_snapshots={},
+        )
+        db.add(cc)
+        await db.flush()
+        rev = Review(
+            repository_id=repo.id,
+            code_change_id=cc.id,
+            triggered_by="test",
+            base_commit=head_sha,
+            target_commit=head_sha,
+            review_status="queued",
+            recommendation="Pending",
+        )
+        db.add(rev)
+        await db.flush()
+        await seed_agent_runs(db, rev.id, configs)
+        await db.commit()
+        review_id = rev.id
+        cc_id = cc.id
+
+    await ReviewCoordinator.execute_review(review_id)
+
+    async with test_session_maker() as db:
+        saved_cc = (await db.execute(select(CodeChange).where(CodeChange.id == cc_id))).scalar_one()
+        assert "app.py" in (saved_cc.file_snapshots or {})
+        diff_run = (
+            await db.execute(
+                select(AgentRun).where(AgentRun.review_id == review_id, AgentRun.agent_name == "diff_agent")
+            )
+        ).scalar_one()
+        assert diff_run.status == "completed"
+        assert diff_run.duration_ms == 42
+        assert diff_run.tool_results == {"file_count": 1, "llm_skipped_token_saver": True}
+
+    await test_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_subagent_llm_timeout_resilience_no_incomplete_blocking(tmp_path: Path, monkeypatch):
+    from app.agents.diff_agent import DiffAgentExecutor
+    from app.agents.fix_suggestion_agent import FixSuggestionAgentExecutor
+    from app.agents.reviewer_manager import ReviewerManagerExecutor
+    from app.agents.security_agent import SecurityAgentExecutor
+    from app.agents.style_agent import StyleAgentExecutor
+    from app.agents.test_coverage_agent import TestCoverageAgentExecutor
+    from app.config import AGENT_METADATA
+    from app.intelligence.structure_indexer import build_structure_index
+    from app.orchestration.shared_state import AgentExecutionConfig
+    from app.planning.review_planner import build_review_plan
+
+    await _arun_git("init", cwd=tmp_path)
+    await _arun_git("config", "user.email", "dev@example.com", cwd=tmp_path)
+    await _arun_git("config", "user.name", "Dev", cwd=tmp_path)
+
+    src = (
+        "import subprocess\n"
+        "import os\n\n"
+        "def run_cmd(user_arg: str) -> None:\n"
+        "    unused_x = 1\n"
+        "    subprocess.run(user_arg, shell=True)\n"
+    )
+    (tmp_path / "svc.py").write_text(src, encoding="utf-8")
+    (tmp_path / "test_svc.py").write_text(
+        "def test_basic():\n    assert 1 + 1 == 2\n",
+        encoding="utf-8",
+    )
+    await _arun_git("add", ".", cwd=tmp_path)
+    await _arun_git("commit", "-m", "initial commit", cwd=tmp_path)
+    diff_patch = await _arun_git_out("show", "--format=", "HEAD", cwd=tmp_path)
+
+    configs = {
+        k: AgentExecutionConfig(
+            agent_name=k,
+            label=m["label"],
+            model=m["default_model"],
+            base_url="https://api.deepseek.com",
+            api_key="sk-test-key",
+        )
+        for k, m in AGENT_METADATA.items()
+    }
+    changed = [
+        {"path": "svc.py", "status": "added", "changed_lines": [1, 2, 4, 5, 6]},
+        {"path": "test_svc.py", "status": "added", "changed_lines": [1, 2]},
+    ]
+    s_idx = build_structure_index(tmp_path, changed)
+    plan = build_review_plan(changed_files=changed, structure_index=s_idx, diff_text=diff_patch)
+
+    async def _always_timeout(cfg, **_kwargs):
+        raise TimeoutError(f"{cfg.label} ({cfg.model}) exceeded 110s response timeout.")
+
+    for target_mod in (
+        "app.agents.diff_agent.run_structured_agent",
+        "app.agents.style_agent.run_structured_agent",
+        "app.agents.security_agent.run_structured_agent",
+        "app.agents.test_coverage_agent.run_structured_agent",
+        "app.agents.reviewer_manager.run_structured_agent",
+        "app.agents.fix_suggestion_agent.run_structured_agent",
+    ):
+        monkeypatch.setattr(target_mod, _always_timeout)
+
+    emitted: list[tuple[str, dict[str, object]]] = []
+
+    async def _noop_emit(_rid: str, ev: str, pl: dict[str, object]) -> None:
+        emitted.append((ev, pl))
+
+    class _FanOutSink(Executor):
+        def __init__(self) -> None:
+            super().__init__(id="timeout_fanout_sink")
+            self.outputs: list[AgentExecutionOutput] = []
+
+        @handler
+        async def take(self, msg: AgentExecutionOutput, ctx: WorkflowContext[AgentExecutionOutput]) -> None:
+            self.outputs.append(msg)
+
+    base_state = ReviewState(
+        review_id="rev-timeout-resilience",
+        repository_id="r-res",
+        repository_name="org/svc",
+        source_type="local",
+        base_commit="EMPTY_TREE",
+        target_commit="HEAD",
+        workspace_dir=tmp_path,
+        diff_text=diff_patch,
+        changed_files=changed,
+        structure_index=s_idx,
+        review_plan=plan,
+        policy={},
+        agent_configs=configs,
+        cache_dir=tmp_path / "_cache",
+    )
+
+    fanout_results: list[AgentExecutionOutput] = []
+    for exec_cls in (DiffAgentExecutor, StyleAgentExecutor, SecurityAgentExecutor, TestCoverageAgentExecutor):
+        ex = exec_cls(_noop_emit)
+        sk = _FanOutSink()
+        wf = WorkflowBuilder(start_executor=ex).add_edge(ex, sk).build()
+        await wf.run(base_state)
+        assert sk.outputs, f"{exec_cls.__name__} emitted no output"
+        out = sk.outputs[0]
+        # Deterministic engines succeeded -> agent must NOT become failed/incomplete on LLM timeout!
+        assert out.status == "completed", f"{out.agent_name} failed on timeout: {out.error_message}"
+        fanout_results.append(out)
+
+    sec_out = next(r for r in fanout_results if r.agent_name == "security_agent")
+    assert sec_out.tool_results.get("llm_degraded"), "security_agent should record llm_degraded telemetry"
+    assert len(sec_out.findings) >= 1, "Bandit/taint deterministic hits must be preserved on LLM timeout"
+
+    # Inject extra low Ruff lints to verify passthrough optimization + ReviewerManager graceful timeout
+    style_out = next(r for r in fanout_results if r.agent_name == "style_agent")
+    for idx_i in range(45):
+        style_out.tool_results.setdefault("ruff", {"status": "completed", "findings": []})["findings"].append(
+            {
+                "tool": "ruff",
+                "rule_id": f"UP{idx_i:03d}",
+                "file_path": "svc.py",
+                "line_number": (idx_i % 6) + 1,
+                "severity": "Low",
+                "message": f"Minor style hint {idx_i}",
+            }
+        )
+
+    class _RmSink(Executor):
+        def __init__(self) -> None:
+            super().__init__(id="timeout_rm_sink")
+            self.states: list[ReviewState] = []
+
+        @handler
+        async def take(self, msg: ReviewState, ctx: WorkflowContext[ReviewState]) -> None:
+            self.states.append(msg)
+
+    class _RmSeeder(Executor):
+        def __init__(self, st: ReviewState, res: list[AgentExecutionOutput]) -> None:
+            super().__init__(id="timeout_rm_seeder")
+            self._st = st
+            self._res = res
+
+        @handler
+        async def go(self, _t: str, ctx: WorkflowContext[list[AgentExecutionOutput]]) -> None:
+            ctx.set_state("review_state", self._st)
+            await ctx.send_message(self._res)
+
+    rm_exec = ReviewerManagerExecutor(_noop_emit)
+    rm_sink = _RmSink()
+    seeder = _RmSeeder(base_state, fanout_results)
+    await WorkflowBuilder(start_executor=seeder).add_edge(seeder, rm_exec).add_edge(rm_exec, rm_sink).build().run("go")
+    st_after_rm = rm_sink.states[0]
+    rm_res = st_after_rm.agent_results["reviewer_manager"]
+    assert rm_res["status"] == "completed"
+    assert rm_res["tool_results"].get("llm_degraded")
+    assert rm_res["tool_results"]["passthrough_verified_count"] >= 40
+    # Must NOT become Incomplete — Request Changes because Verified High shell=True finding exists
+    assert st_after_rm.recommendation == "Request Changes"
+
+    # Fix-Suggestion Agent degrades per target without crashing or marking review Incomplete
+    fix_exec = FixSuggestionAgentExecutor(_noop_emit)
+
+    class _FixSink(Executor):
+        def __init__(self) -> None:
+            super().__init__(id="timeout_fix_sink")
+            self.states: list[ReviewState] = []
+
+        @handler
+        async def take(self, msg: ReviewState, ctx: WorkflowContext[ReviewState]) -> None:
+            self.states.append(msg)
+
+    await WorkflowBuilder(start_executor=fix_exec).add_edge(fix_exec, _FixSink()).build().run(st_after_rm)
+    fix_res = st_after_rm.agent_results["fix_suggestion_agent"]
+    assert fix_res["status"] == "completed"
+    assert fix_res["tool_results"].get("llm_degraded_targets")
+    assert st_after_rm.recommendation == "Request Changes"
+
+
+@pytest.mark.asyncio
+async def test_llm_factory_streaming_and_adaptive_timeout():
+    from types import SimpleNamespace
+
+    from app.agents.llm_factory import _run_with_stream_fallback, effective_agent_timeout
+    from app.orchestration.shared_state import AgentExecutionConfig
+
+    pro_cfg = AgentExecutionConfig("security_agent", "Security Agent", "deepseek-v4-pro", "https://api.deepseek.com", "sk-x")
+    flash_cfg = AgentExecutionConfig("diff_agent", "Diff Agent", "deepseek-flash", "https://api.deepseek.com", "sk-x")
+    assert effective_agent_timeout(pro_cfg, 75.0) >= 110.0
+    assert effective_agent_timeout(flash_cfg, 75.0) == 75.0
+
+    class _FakeStream:
+        def __init__(self) -> None:
+            self.closed = False
+            self._items = [SimpleNamespace(text='{"ok": '), SimpleNamespace(text="true}")]
+
+        def __aiter__(self):
+            self._idx = 0
+            return self
+
+        async def __anext__(self):
+            if self._idx >= len(self._items):
+                raise StopAsyncIteration
+            val = self._items[self._idx]
+            self._idx += 1
+            return val
+
+        async def get_final_response(self):
+            return SimpleNamespace(text='{"ok": true}', usage_details={"input_tokens": 10, "output_tokens": 5})
+
+        async def close(self):
+            self.closed = True
+
+    class _FakeAgent:
+        def run(self, _prompt: str, *, stream: bool = False):
+            assert stream is True
+            return _FakeStream()
+
+    resp = await _run_with_stream_fallback(_FakeAgent(), "hello", rid="", timeout_seconds=10.0)
+    assert resp.text == '{"ok": true}'
+
+
+@pytest.mark.asyncio
+async def test_coordinator_timeout_cleans_running_agent_runs(tmp_path: Path, monkeypatch):
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+    import app.database.session as db_sess
+    import app.orchestration.coordinator as coord_mod
+    from app.config import AGENT_METADATA
+    from app.database.session import Base
+    from app.models.tables import AgentRun, CodeChange, Repository, Review, User
+    from app.orchestration.coordinator import ReviewCoordinator, seed_agent_runs
+    from app.orchestration.shared_state import AgentExecutionConfig
+
+    repo_dir = tmp_path / "repo_to"
+    repo_dir.mkdir()
+    await _arun_git("init", cwd=repo_dir)
+    await _arun_git("config", "user.email", "dev@example.com", cwd=repo_dir)
+    await _arun_git("config", "user.name", "Dev", cwd=repo_dir)
+    (repo_dir / "main.py").write_text("x = 1\n", encoding="utf-8")
+    await _arun_git("add", ".", cwd=repo_dir)
+    await _arun_git("commit", "-m", "init", cwd=repo_dir)
+    head_sha = (await _arun_git_out("rev-parse", "HEAD", cwd=repo_dir)).strip()
+
+    db_file = tmp_path / "coord_to.db"
+    test_engine = create_async_engine(f"sqlite+aiosqlite:///{db_file}", connect_args={"check_same_thread": False})
+    test_session_maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    monkeypatch.setattr(db_sess, "engine", test_engine)
+    monkeypatch.setattr(db_sess, "async_session_maker", test_session_maker)
+    monkeypatch.setattr(coord_mod, "async_session_maker", test_session_maker)
+
+    async with test_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    configs = {
+        k: AgentExecutionConfig(k, m["label"], m["default_model"], "https://api.deepseek.com", "sk-t")
+        for k, m in AGENT_METADATA.items()
+    }
+
+    async def _fake_cfg(_db):
+        return configs
+
+    monkeypatch.setattr(coord_mod, "load_effective_agent_configs", _fake_cfg)
+
+    def _timeout_wf(emit_fn):
+        class _FakeWf:
+            async def run(self, state: ReviewState):
+                await emit_fn(state.review_id, "agent_started", {"agent_name": "fix_suggestion_agent"})
+                raise TimeoutError()
+
+        return _FakeWf()
+
+    monkeypatch.setattr(coord_mod, "build_review_workflow", _timeout_wf)
+
+    async with test_session_maker() as db:
+        u = User(email="to@reviewboard.local", name="Dev", password_hash="x")
+        db.add(u)
+        await db.flush()
+        repo = Repository(user_id=u.id, name="repo_to", owner="org", full_name="org/repo_to", source_type="local", local_path=str(repo_dir))
+        db.add(repo)
+        await db.flush()
+        cc = CodeChange(repository_id=repo.id, source_mode="local_diff", base_branch="main", target_branch="main", base_commit=head_sha, target_commit=head_sha, diff_text="diff --git a/main.py b/main.py\n+x = 1\n", changed_files=[{"path": "main.py", "status": "added", "changed_lines": [1]}], file_snapshots={})
+        db.add(cc)
+        await db.flush()
+        rev = Review(repository_id=repo.id, code_change_id=cc.id, triggered_by="test", base_commit=head_sha, target_commit=head_sha, review_status="queued", recommendation="Pending")
+        db.add(rev)
+        await db.flush()
+        await seed_agent_runs(db, rev.id, configs)
+        await db.commit()
+        rid = rev.id
+
+    await ReviewCoordinator.execute_review(rid)
+
+    async with test_session_maker() as db:
+        saved_rev = (await db.execute(select(Review).where(Review.id == rid))).scalar_one()
+        assert saved_rev.recommendation_reason == "Review execution error: TimeoutError"
+        fix_run = (
+            await db.execute(select(AgentRun).where(AgentRun.review_id == rid, AgentRun.agent_name == "fix_suggestion_agent"))
+        ).scalar_one()
+        assert fix_run.status == "incomplete"
+        assert fix_run.error_message == "TimeoutError"
+
+    await test_engine.dispose()
+
 
 
 

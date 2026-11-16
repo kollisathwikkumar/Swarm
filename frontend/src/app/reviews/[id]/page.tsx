@@ -9,6 +9,7 @@ import {
   FileCode2,
   GitCommit,
   Github,
+  Layers,
   LogOut,
   RefreshCw,
   ShieldCheck,
@@ -25,6 +26,7 @@ import type {
   ReviewDetailResponse,
 } from "@/lib/types";
 import { AgentPipelineGraph } from "@/components/AgentPipelineGraph";
+import { PatchCard } from "@/components/PatchCard";
 import {
   RecommendationBadge,
   SeverityBadge,
@@ -115,6 +117,7 @@ export default function ConsolidatedCodeReviewPage() {
             summary?: string;
             error?: string;
             duration_ms?: number;
+            tool_results?: Record<string, unknown>;
           };
 
           if (msg.agent_name) {
@@ -138,6 +141,7 @@ export default function ConsolidatedCodeReviewPage() {
                     status: msg.status || "completed",
                     summary: msg.summary || run.summary,
                     duration_ms: msg.duration_ms ?? run.duration_ms,
+                    tool_results: msg.tool_results ?? run.tool_results,
                   };
                 }
                 if (msg.event_type === "agent_failed") {
@@ -146,6 +150,7 @@ export default function ConsolidatedCodeReviewPage() {
                     status: msg.status || "failed",
                     error_message: msg.error || run.error_message,
                     duration_ms: msg.duration_ms ?? run.duration_ms,
+                    tool_results: msg.tool_results ?? run.tool_results,
                   };
                 }
                 return run;
@@ -324,11 +329,22 @@ export default function ConsolidatedCodeReviewPage() {
   };
 
   const handleCommitAllPatchesToGithub = async () => {
+    const verifiedIds = (detail?.patch_suggestions || [])
+      .filter(
+        (p) =>
+          p.applicability_verified &&
+          (p.approval_status === "pending_approval" || p.approval_status === "approved")
+      )
+      .map((p) => p.id);
+    if (verifiedIds.length === 0) return;
     setBusyAction(true);
     setError("");
     setStatusNotice("");
     try {
-      const { noticeMsg, errorMsg } = await commitAllPatchesToGithub({ review_id: reviewId });
+      const { noticeMsg, errorMsg } = await commitAllPatchesToGithub({
+        review_id: reviewId,
+        patch_ids: verifiedIds,
+      });
       if (noticeMsg) setStatusNotice(noticeMsg);
       if (errorMsg) setError(errorMsg);
       await loadDetail();
@@ -484,6 +500,54 @@ export default function ConsolidatedCodeReviewPage() {
       {/* Tab 1: Three-Column Consolidated Code Review */}
       {activeTab === "review" && (
         <div className="space-y-4">
+          {/* Executive Audit Report & Remediation Roadmap */}
+          <div className="rounded-xl border border-border bg-card p-4 sm:p-5 space-y-3.5">
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border/60 pb-3">
+              <div>
+                <h2 className="text-sm font-semibold text-foreground uppercase tracking-wider flex items-center gap-2">
+                  <Layers className="h-4 w-4 text-primary" />
+                  Executive Audit Report &amp; Remediation Roadmap
+                </h2>
+                <p className="text-xs text-muted-foreground mt-0.5">
+                  6-Agent cross-verified review telemetry across STAIR hierarchical index and isolated AST sandboxes.
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <RecommendationBadge recommendation={review.recommendation} />
+              </div>
+            </div>
+
+            {/* Metric Cards Row */}
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-2.5">
+              <div className="rounded-lg border border-red-500/30 bg-red-500/10 p-2.5 text-center">
+                <p className="text-[10px] font-mono font-semibold uppercase text-red-700 dark:text-red-300">Critical Blockers</p>
+                <p className="text-lg font-bold text-red-700 dark:text-red-300">{findings.filter((f) => f.severity === "Critical").length}</p>
+              </div>
+              <div className="rounded-lg border border-orange-500/30 bg-orange-500/10 p-2.5 text-center">
+                <p className="text-[10px] font-mono font-semibold uppercase text-orange-700 dark:text-orange-300">High Risk</p>
+                <p className="text-lg font-bold text-orange-700 dark:text-orange-300">{findings.filter((f) => f.severity === "High").length}</p>
+              </div>
+              <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-2.5 text-center">
+                <p className="text-[10px] font-mono font-semibold uppercase text-amber-700 dark:text-amber-300">Medium Quality</p>
+                <p className="text-lg font-bold text-amber-700 dark:text-amber-300">{findings.filter((f) => f.severity === "Medium").length}</p>
+              </div>
+              <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-2.5 text-center">
+                <p className="text-[10px] font-mono font-semibold uppercase text-emerald-700 dark:text-emerald-300">Verified Evidence</p>
+                <p className="text-lg font-bold text-emerald-700 dark:text-emerald-300">{findings.filter((f) => f.verification_status === "Verified").length}</p>
+              </div>
+              <div className="rounded-lg border border-sky-500/30 bg-sky-500/10 p-2.5 text-center">
+                <p className="text-[10px] font-mono font-semibold uppercase text-sky-700 dark:text-sky-300">Verified Fixes</p>
+                <p className="text-lg font-bold text-sky-700 dark:text-sky-300">{patch_suggestions.filter((p) => p.applicability_verified).length}</p>
+              </div>
+            </div>
+
+            {/* Recommendation Summary */}
+            <div className="rounded-lg border border-border bg-muted/30 p-3 text-xs leading-relaxed text-foreground">
+              <span className="font-semibold text-primary">Verdict Reason: </span>
+              {review.recommendation_reason || "All mandatory security, style, and test coverage scans completed."}
+            </div>
+          </div>
+
           {rejectedFps.length > 0 && (
             <div className="rounded-xl border border-emerald-500/35 bg-emerald-500/10 p-3.5 text-xs">
               <p className="font-semibold text-emerald-800 dark:text-emerald-300">
@@ -720,7 +784,7 @@ export default function ConsolidatedCodeReviewPage() {
           <section className="rounded-xl border border-border bg-card p-5">
             <h2 className="mb-3 text-base font-semibold">Tool Telemetry</h2>
             <div className="grid gap-4 md:grid-cols-2">
-              {detail.agent_runs.map((run) => (
+              {liveRuns.map((run) => (
                 <div key={run.id} className="rounded-lg border border-border bg-muted/60 p-3">
                   <p className="font-mono text-xs font-semibold">{run.agent_label}</p>
                   <pre className="rb-scroll mt-2 max-h-56 font-mono text-[11px] text-muted-foreground">
@@ -738,11 +802,13 @@ export default function ConsolidatedCodeReviewPage() {
         <div className="space-y-4">
           {review.source_type === "github" &&
             patch_suggestions.some(
-              (p) => p.approval_status === "pending_approval" || p.approval_status === "approved"
+              (p) =>
+                p.applicability_verified &&
+                (p.approval_status === "pending_approval" || p.approval_status === "approved")
             ) && (
               <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border bg-card px-4 py-3">
                 <p className="text-xs text-muted-foreground">
-                  Approve and commit all pending/approved fixes for this review directly to GitHub.
+                  Approve and commit all verified pending/approved fixes for this review directly to GitHub.
                 </p>
                 <button
                   type="button"
@@ -754,7 +820,9 @@ export default function ConsolidatedCodeReviewPage() {
                   Approve &amp; Commit All to GitHub (
                   {
                     patch_suggestions.filter(
-                      (p) => p.approval_status === "pending_approval" || p.approval_status === "approved"
+                      (p) =>
+                        p.applicability_verified &&
+                        (p.approval_status === "pending_approval" || p.approval_status === "approved")
                     ).length
                   }
                   )
@@ -766,99 +834,17 @@ export default function ConsolidatedCodeReviewPage() {
               No fix suggestions generated for this review.
             </div>
           ) : (
-            patch_suggestions.map((patch) => (
-              <article key={patch.id} className="space-y-4 rounded-xl border border-border bg-card p-5">
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div>
-                    <h2 className="text-base font-semibold">{patch.title}</h2>
-                    <p className="font-mono text-xs text-muted-foreground">{patch.file_path}</p>
-                    <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
-                      {patch.explanation}
-                    </p>
-                  </div>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span
-                      className={`inline-flex items-center gap-1 rounded px-2.5 py-1 font-mono text-[11px] font-semibold ${
-                        patch.applicability_verified
-                          ? "bg-emerald-500/12 text-emerald-700 dark:text-emerald-300"
-                          : "bg-amber-500/12 text-amber-800 dark:text-amber-300"
-                      }`}
-                    >
-                      <ShieldCheck className="h-3.5 w-3.5" aria-hidden="true" />
-                      {patch.validation_output ||
-                        (patch.applicability_verified
-                          ? "git apply --check + Syntax: Verified"
-                          : "Needs verification")}
-                    </span>
-                    <span className="rounded border border-border bg-muted px-2 py-0.5 font-mono text-[10px] uppercase text-muted-foreground">
-                      {patch.approval_status}
-                    </span>
-                  </div>
-                </div>
-
-                  <div className="h-80 overflow-hidden rounded-lg border border-border">
-                    <DiffEditor
-                      height="100%"
-                      theme={resolved === "dark" ? "vs-dark" : "light"}
-                      language={guessLanguage(patch.file_path)}
-                      original={patch.original_code}
-                      modified={patch.proposed_code}
-                      options={{ readOnly: true, minimap: { enabled: false }, fontSize: 12 }}
-                    />
-                  </div>
-
-                  <div className="flex flex-wrap items-center justify-end gap-2">
-                    <button
-                      type="button"
-                      disabled={busyAction || patch.approval_status === "applied"}
-                      onClick={() => handlePatchDecision(patch, "reject")}
-                      className="inline-flex min-h-10 items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-rose-700 hover:bg-rose-500/10 disabled:opacity-50 dark:text-rose-300"
-                    >
-                      <X className="h-3.5 w-3.5" aria-hidden="true" />
-                      Reject
-                    </button>
-                    <button
-                      type="button"
-                      disabled={busyAction || patch.approval_status === "approved" || patch.approval_status === "applied"}
-                      onClick={() => handlePatchDecision(patch, "approve")}
-                      className="inline-flex min-h-10 items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-emerald-700 hover:bg-emerald-500/10 disabled:opacity-50 dark:text-emerald-300"
-                    >
-                      <Check className="h-3.5 w-3.5" aria-hidden="true" />
-                      Approve Patch
-                    </button>
-                    {review.source_type === "local" && (
-                      <button
-                        type="button"
-                        disabled={busyAction || !patch.applicability_verified || patch.approval_status === "applied"}
-                        onClick={() => handlePatchDecision(patch, "apply_local")}
-                        className="inline-flex min-h-10 items-center gap-1.5 rounded-lg bg-primary px-3.5 py-1.5 text-xs font-semibold text-primary-foreground disabled:opacity-50"
-                      >
-                        {patch.approval_status === "applied" ? "Applied Locally" : "Approve & Apply Locally"}
-                      </button>
-                    )}
-                    {review.source_type === "github" && code_change.pr_number && (
-                      <button
-                        type="button"
-                        disabled={busyAction}
-                        onClick={() => handlePatchDecision(patch, "publish_github_suggestion")}
-                        className="inline-flex min-h-10 items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs font-semibold hover:bg-muted disabled:opacity-50"
-                      >
-                        Post PR Suggestion Comment
-                      </button>
-                    )}
-                    {review.source_type === "github" && (
-                      <button
-                        type="button"
-                        disabled={busyAction || patch.approval_status === "applied" || patch.approval_status === "rejected"}
-                        onClick={() => handlePatchDecision(patch, "commit_to_github_branch")}
-                        className="inline-flex min-h-10 items-center gap-1.5 rounded-lg bg-primary px-3.5 py-1.5 text-xs font-semibold text-primary-foreground disabled:opacity-50"
-                      >
-                        {patch.approval_status === "applied" ? "Committed to GitHub" : "Approve & Commit to GitHub"}
-                      </button>
-                    )}
-                  </div>
-                </article>
-            ))
+            <div className="space-y-6">
+              {patch_suggestions.map((patch) => (
+                <PatchCard
+                  key={patch.id}
+                  patch={patch}
+                  busy={busyAction}
+                  onDecision={handlePatchDecision}
+                  showReviewLink={false}
+                />
+              ))}
+            </div>
           )}
         </div>
       )}
