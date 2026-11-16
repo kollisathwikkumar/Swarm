@@ -53,11 +53,14 @@ export default function RootLayout({
       className={`${manrope.variable} ${jetbrainsMono.variable}`}
       suppressHydrationWarning
     >
-      <head>
-        <meta name="color-scheme" content="light dark" />
-        <script dangerouslySetInnerHTML={{ __html: FOUC_SCHEME_SCRIPT }} />
+      <head suppressHydrationWarning>
+        <script
+          id="fouc-theme-script"
+          dangerouslySetInnerHTML={{ __html: FOUC_SCHEME_SCRIPT }}
+          suppressHydrationWarning
+        />
       </head>
-      <body>
+      <body suppressHydrationWarning>
         <AppShell>{children}</AppShell>
       </body>
     </html>
