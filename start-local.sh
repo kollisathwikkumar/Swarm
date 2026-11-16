@@ -55,6 +55,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
+echo "Ensuring ports 8000 and 3000 are clear..."
+kill -9 $(lsof -ti :8000,3000) 2>/dev/null || true
+
 echo "Clearing stale Next.js dev cache..."
 rm -rf "$ROOT_DIR/frontend/.next"
 
